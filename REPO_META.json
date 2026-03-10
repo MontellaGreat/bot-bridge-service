@@ -1,0 +1,5 @@
+{
+  "name": "bot-bridge-service",
+  "description": "Lightweight bot-to-bot bridge service with SQLite persistence, systemd examples, and worker docs",
+  "private": false
+}

@@ -1,0 +1,15 @@
+[Unit]
+Description=OpenClaw Bot Bridge Service (SQLite)
+After=network.target
+
+[Service]
+Type=simple
+User=admin
+WorkingDirectory=/home/admin/.openclaw/workspace/services/bot-bridge
+EnvironmentFile=/home/admin/.openclaw/workspace/services/bot-bridge/.env
+ExecStart=/usr/bin/node /home/admin/.openclaw/workspace/services/bot-bridge/server-sqlite.js
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
