@@ -35,11 +35,24 @@ BRIDGE_URL=http://127.0.0.1:${BRIDGE_PORT} \
 BRIDGE_NODE_ID=openclaw-node-b \
 BRIDGE_TARGET_AGENT=main \
 BRIDGE_WORKER_MODE=openclaw-cli \
+BRIDGE_FALLBACK_TO_MOCK=false \
 OPENCLAW_RUN_TIMEOUT_MS=30000 \
 node worker-openclaw.js
 ```
 
-如果真实模式不通，再回退 mock：
+如果真实模式不通，可启用自动降级：
+```bash
+source .env
+BRIDGE_URL=http://127.0.0.1:${BRIDGE_PORT} \
+BRIDGE_NODE_ID=openclaw-node-b \
+BRIDGE_TARGET_AGENT=main \
+BRIDGE_WORKER_MODE=openclaw-cli \
+BRIDGE_FALLBACK_TO_MOCK=true \
+OPENCLAW_RUN_TIMEOUT_MS=30000 \
+node worker-openclaw.js
+```
+
+如果只想纯验证桥接：
 ```bash
 source .env
 BRIDGE_URL=http://127.0.0.1:${BRIDGE_PORT} \
@@ -101,6 +114,7 @@ curl http://127.0.0.1:${BRIDGE_PORT}/tasks/task_xxx \
 - `finishedAt`
 - `resultSummary`
 - `result`
+- `executionMode`
 
 如果失败，应有：
 - `status: failed`
@@ -116,14 +130,23 @@ curl http://127.0.0.1:${BRIDGE_PORT}/tasks/task_xxx \
 cat data/worker-results/task_xxx.json
 ```
 
-如果是 `openclaw-cli` 模式，里面应看到：
+### 如果是真实模式
+里面应看到：
 - `executionMode: openclaw-cli`
 - `stdout`
 - `stderr`
 - `args`
 
-如果是 `mock` 模式，则是：
+### 如果自动降级了
+结果里应看到：
 - `executionMode: mock`
+- `fallbackFrom: openclaw-cli`
+- `fallbackReason`
+
+### 如果是纯 mock
+则是：
+- `executionMode: mock`
+- 没有 fallback 原因
 
 ---
 
@@ -142,7 +165,10 @@ cat data/worker-results/task_xxx.json
 - `OPENCLAW_RUN_TIMEOUT_MS` 是否太短
 
 ### 3. 真实模式不稳定
-先退回 `BRIDGE_WORKER_MODE=mock`，确认桥接链路没问题，再继续调真实执行。
+可以：
+- 先启用 `BRIDGE_FALLBACK_TO_MOCK=true`
+- 继续验证桥接链路
+- 同时单独排查本机 OpenClaw runtime 问题
 
 ---
 
@@ -150,5 +176,6 @@ cat data/worker-results/task_xxx.json
 
 1. 先用 `mock` 模式验证桥接链路
 2. 再用 `openclaw-cli` 模式验证真实执行
-3. 再测试不同 `target_agent`
-4. 再测试失败路径和超时路径
+3. 如真实执行不稳，再启用自动降级
+4. 再测试不同 `target_agent`
+5. 最后测试失败路径和超时路径

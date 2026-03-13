@@ -16,6 +16,7 @@ const RESULT_DIR = process.env.BRIDGE_RESULT_DIR || path.join(__dirname, 'data',
 const OPENCLAW_BIN = process.env.OPENCLAW_BIN || 'openclaw';
 const OPENCLAW_RUN_TIMEOUT_MS = Number(process.env.OPENCLAW_RUN_TIMEOUT_MS || 30000);
 const WORKER_MODE = process.env.BRIDGE_WORKER_MODE || 'openclaw-cli'; // openclaw-cli | mock
+const FALLBACK_TO_MOCK = String(process.env.BRIDGE_FALLBACK_TO_MOCK || 'false').toLowerCase() === 'true';
 
 fs.mkdirSync(RESULT_DIR, { recursive: true });
 
@@ -73,15 +74,19 @@ function writeArtifact(taskId, payload) {
   return artifactPath;
 }
 
-async function executeMock(task) {
+async function executeMock(task, fallbackReason = null) {
   const startedAt = new Date().toISOString();
   const output = {
     taskId: task.id,
     targetAgent: task.targetAgent || task.target,
     executionMode: 'mock',
+    fallbackFrom: fallbackReason ? 'openclaw-cli' : null,
+    fallbackReason,
     content: task.content,
     metadata: task.metadata || {},
-    summary: `Mock worker accepted task for agent ${task.targetAgent || task.target}`,
+    summary: fallbackReason
+      ? `Mock fallback executed task for agent ${task.targetAgent || task.target}`
+      : `Mock worker accepted task for agent ${task.targetAgent || task.target}`,
   };
   const artifactPath = writeArtifact(task.id, output);
   await sleep(1200);
@@ -93,6 +98,8 @@ async function executeMock(task) {
     remoteSessionKey: null,
     startedAt,
     finishedAt: new Date().toISOString(),
+    executionMode: 'mock',
+    fallbackReason,
   };
 }
 
@@ -127,7 +134,11 @@ async function executeViaOpenClawCli(task) {
       args,
     };
     const artifactPath = writeArtifact(task.id, artifact);
-    throw new Error(`openclaw_cli_failed: ${err.message}; artifact=${artifactPath}`);
+    const message = `openclaw_cli_failed: ${err.message}; artifact=${artifactPath}`;
+    if (FALLBACK_TO_MOCK) {
+      return executeMock(task, message);
+    }
+    throw new Error(message);
   }
 
   const output = {
@@ -148,6 +159,8 @@ async function executeViaOpenClawCli(task) {
     remoteSessionKey: null,
     startedAt,
     finishedAt: new Date().toISOString(),
+    executionMode: 'openclaw-cli',
+    fallbackReason: null,
   };
 }
 
@@ -173,6 +186,8 @@ async function handleTask(task) {
       startedAt: result.startedAt,
       finishedAt: result.finishedAt,
       artifactPath: result.artifactPath,
+      executionMode: result.executionMode,
+      fallbackReason: result.fallbackReason,
     });
     console.log(`[worker] done ${task.id}`);
   } catch (err) {
@@ -189,7 +204,7 @@ async function handleTask(task) {
 }
 
 async function main() {
-  console.log(`[worker] bridge=${BRIDGE_URL} node=${BRIDGE_NODE_ID} targetAgent=${TARGET_AGENT} mode=${WORKER_MODE}`);
+  console.log(`[worker] bridge=${BRIDGE_URL} node=${BRIDGE_NODE_ID} targetAgent=${TARGET_AGENT} mode=${WORKER_MODE} fallbackToMock=${FALLBACK_TO_MOCK}`);
   while (true) {
     try {
       const tasks = await listQueuedTasks();

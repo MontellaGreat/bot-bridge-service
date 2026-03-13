@@ -24,6 +24,7 @@
 这第三轮升级主要完成：
 - 增加真实 OpenClaw 调用入口的 worker 版本
 - 在 worker 中支持 `mock` / `openclaw-cli` 两种执行模式
+- 支持真实模式失败时按配置自动降级到 mock
 - 补充完整测试办法，验证 bridge 闭环与真实 agent 执行
 
 ---
@@ -48,69 +49,8 @@
 - 执行本地 worker 逻辑：
   - `mock`
   - `openclaw-cli`
+- 可选自动降级：`openclaw-cli -> mock`
 - 回写 `done` / `failed`
-
-### 目标中的任务状态
-- `queued`
-- `claimed`
-- `accepted`
-- `running`
-- `handoff`
-- `done`
-- `failed`
-- `blocked`
-- `stopped`
-- `timeout`
-
----
-
-## 最小运行方式
-
-### 1. 启动服务端
-```bash
-source .env
-node server-sqlite.js
-```
-
-### 2. 启动 worker（真实模式）
-```bash
-source .env
-BRIDGE_URL=http://127.0.0.1:${BRIDGE_PORT} \
-BRIDGE_NODE_ID=openclaw-node-b \
-BRIDGE_TARGET_AGENT=main \
-BRIDGE_WORKER_MODE=openclaw-cli \
-OPENCLAW_RUN_TIMEOUT_MS=30000 \
-node worker-openclaw.js
-```
-
-### 3. 启动 worker（mock 模式）
-```bash
-source .env
-BRIDGE_URL=http://127.0.0.1:${BRIDGE_PORT} \
-BRIDGE_NODE_ID=openclaw-node-b \
-BRIDGE_TARGET_AGENT=main \
-BRIDGE_WORKER_MODE=mock \
-node worker-openclaw.js
-```
-
-### 4. 创建任务
-```bash
-curl -X POST http://127.0.0.1:${BRIDGE_PORT}/tasks \
-  -H "Authorization: Bearer ${BRIDGE_TOKEN}" \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "source_node":"openclaw-node-a",
-    "source_agent":"main",
-    "target_node":"openclaw-node-b",
-    "target_agent":"main",
-    "type":"delegated_work",
-    "title":"桥接测试",
-    "content":"请返回一句：远端 OpenClaw agent 已收到并执行任务。",
-    "priority":"normal",
-    "complexity":"L2",
-    "conversation_id":"conv-001"
-  }'
-```
 
 ---
 
@@ -119,6 +59,8 @@ curl -X POST http://127.0.0.1:${BRIDGE_PORT}/tasks \
 - `PROTOCOL.md`
 - `WORKER_PLAN.md`
 - `TESTING.md`
+- `CURRENT_TEST_STATUS.md`
+- `REMOTE_OPENCLAW_RUNTIME_TROUBLESHOOTING.md`
 
 ---
 
@@ -127,6 +69,7 @@ curl -X POST http://127.0.0.1:${BRIDGE_PORT}/tasks \
 第三轮已经接入真实 OpenClaw CLI 入口，但仍属于最小实现：
 - 真实执行依赖本机 `openclaw` CLI 能正常工作
 - 当前先通过 `openclaw-cli` 模式调用
+- 自动降级只能保证桥接链路继续工作，不能替代真实 agent 执行
 - 还未接入更细的 session 管理、节点鉴权和重试策略
 
 ---
