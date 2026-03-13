@@ -24,6 +24,8 @@ const WORKER_CAPABILITIES = String(process.env.BRIDGE_WORKER_CAPABILITIES || '')
 let currentTaskId = null;
 let currentWorkerStatus = 'idle';
 let heartbeatTimer = null;
+let heartbeatSupported = true;
+let heartbeatWarningShown = false;
 
 fs.mkdirSync(RESULT_DIR, { recursive: true });
 
@@ -39,31 +41,52 @@ async function api(pathname, options = {}) {
   });
   if (!res.ok) {
     const text = await res.text();
-    throw new Error(`HTTP ${res.status}: ${text}`);
+    const err = new Error(`HTTP ${res.status}: ${text}`);
+    err.status = res.status;
+    err.responseText = text;
+    err.pathname = pathname;
+    throw err;
   }
   return res.json();
+}
+
+function markHeartbeatUnsupported(err) {
+  heartbeatSupported = false;
+  if (!heartbeatWarningShown) {
+    heartbeatWarningShown = true;
+    console.warn(`[worker] heartbeat disabled: bridge does not support /workers/heartbeat (${err.message || err})`);
+  }
 }
 
 async function sendHeartbeat(status = currentWorkerStatus, taskId = currentTaskId) {
   currentWorkerStatus = status;
   currentTaskId = taskId || null;
-  return api('/workers/heartbeat', {
-    method: 'POST',
-    body: JSON.stringify({
-      workerId: WORKER_ID,
-      nodeId: BRIDGE_NODE_ID,
-      targetAgent: TARGET_AGENT,
-      capabilities: WORKER_CAPABILITIES,
-      mode: WORKER_MODE,
-      status: currentWorkerStatus,
-      currentTaskId: currentTaskId,
-      metadata: {
-        pollIntervalMs: POLL_INTERVAL_MS,
-        heartbeatIntervalMs: HEARTBEAT_INTERVAL_MS,
-        fallbackToMock: FALLBACK_TO_MOCK,
-      },
-    }),
-  });
+  if (!heartbeatSupported) return null;
+  try {
+    return await api('/workers/heartbeat', {
+      method: 'POST',
+      body: JSON.stringify({
+        workerId: WORKER_ID,
+        nodeId: BRIDGE_NODE_ID,
+        targetAgent: TARGET_AGENT,
+        capabilities: WORKER_CAPABILITIES,
+        mode: WORKER_MODE,
+        status: currentWorkerStatus,
+        currentTaskId: currentTaskId,
+        metadata: {
+          pollIntervalMs: POLL_INTERVAL_MS,
+          heartbeatIntervalMs: HEARTBEAT_INTERVAL_MS,
+          fallbackToMock: FALLBACK_TO_MOCK,
+        },
+      }),
+    });
+  } catch (err) {
+    if (err && err.pathname === '/workers/heartbeat' && err.status === 404) {
+      markHeartbeatUnsupported(err);
+      return null;
+    }
+    throw err;
+  }
 }
 
 function startHeartbeatLoop() {
@@ -225,7 +248,9 @@ async function executeLocally(task) {
 async function handleTask(task) {
   console.log(`[worker] claiming ${task.id}`);
   await claimTask(task.id);
-  await sendHeartbeat('busy', task.id);
+  await sendHeartbeat('busy', task.id).catch(err => {
+    console.error('[worker] heartbeat error after claim:', err.message || err);
+  });
   await updateStatus(task.id, 'accepted');
   await updateStatus(task.id, 'running');
   try {
@@ -261,14 +286,18 @@ async function handleTask(task) {
       });
     }
   } finally {
-    await sendHeartbeat('idle', null).catch(() => {});
+    await sendHeartbeat('idle', null).catch(err => {
+      console.error('[worker] heartbeat error when returning idle:', err.message || err);
+    });
   }
 }
 
 async function main() {
   console.log(`[worker] bridge=${BRIDGE_URL} node=${BRIDGE_NODE_ID} targetAgent=${TARGET_AGENT} mode=${WORKER_MODE} fallbackToMock=${FALLBACK_TO_MOCK}`);
   console.log(`[worker] capabilities=${WORKER_CAPABILITIES.join(',') || '(none declared)'}`);
-  await sendHeartbeat('idle', null);
+  await sendHeartbeat('idle', null).catch(err => {
+    console.error('[worker] initial heartbeat error:', err.message || err);
+  });
   startHeartbeatLoop();
   while (true) {
     try {
