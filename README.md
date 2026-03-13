@@ -21,10 +21,10 @@
 
 当前仓库正在从 v1 的 bot-bridge 形态升级到 v2 方向的 agent bridge。
 
-这第二轮升级主要完成：
-- 增加最小 OpenClaw worker 骨架
-- 打通 poll -> claim -> status -> result 的完整闭环
-- 为后续接真实 OpenClaw agent 执行预留入口
+这第三轮升级主要完成：
+- 增加真实 OpenClaw 调用入口的 worker 版本
+- 在 worker 中支持 `mock` / `openclaw-cli` 两种执行模式
+- 补充完整测试办法，验证 bridge 闭环与真实 agent 执行
 
 ---
 
@@ -41,11 +41,13 @@
 - Bearer Token 鉴权
 - SQLite 持久化
 
-### Worker（第二轮新增）
+### Worker（第三轮）
 - 轮询属于本节点/本 agent 的 `queued` 任务
 - claim 任务
 - 更新 `accepted` / `running`
-- 执行本地 worker 逻辑（当前为 mock 闭环）
+- 执行本地 worker 逻辑：
+  - `mock`
+  - `openclaw-cli`
 - 回写 `done` / `failed`
 
 ### 目标中的任务状态
@@ -70,16 +72,28 @@ source .env
 node server-sqlite.js
 ```
 
-### 2. 启动 worker
+### 2. 启动 worker（真实模式）
 ```bash
 source .env
 BRIDGE_URL=http://127.0.0.1:${BRIDGE_PORT} \
 BRIDGE_NODE_ID=openclaw-node-b \
-BRIDGE_TARGET_AGENT=tanzhen \
+BRIDGE_TARGET_AGENT=main \
+BRIDGE_WORKER_MODE=openclaw-cli \
+OPENCLAW_RUN_TIMEOUT_MS=30000 \
 node worker-openclaw.js
 ```
 
-### 3. 创建任务
+### 3. 启动 worker（mock 模式）
+```bash
+source .env
+BRIDGE_URL=http://127.0.0.1:${BRIDGE_PORT} \
+BRIDGE_NODE_ID=openclaw-node-b \
+BRIDGE_TARGET_AGENT=main \
+BRIDGE_WORKER_MODE=mock \
+node worker-openclaw.js
+```
+
+### 4. 创建任务
 ```bash
 curl -X POST http://127.0.0.1:${BRIDGE_PORT}/tasks \
   -H "Authorization: Bearer ${BRIDGE_TOKEN}" \
@@ -88,55 +102,39 @@ curl -X POST http://127.0.0.1:${BRIDGE_PORT}/tasks \
     "source_node":"openclaw-node-a",
     "source_agent":"main",
     "target_node":"openclaw-node-b",
-    "target_agent":"tanzhen",
+    "target_agent":"main",
     "type":"delegated_work",
-    "title":"调研远端协作方案",
-    "content":"请分析并给出推荐路径",
+    "title":"桥接测试",
+    "content":"请返回一句：远端 OpenClaw agent 已收到并执行任务。",
     "priority":"normal",
-    "complexity":"L3",
-    "conversation_id":"conv-001",
-    "metadata":{"timeout_seconds":600}
+    "complexity":"L2",
+    "conversation_id":"conv-001"
   }'
 ```
 
 ---
 
-## 目录
-```bash
-.
-├── README.md
-├── ARCHITECTURE.md
-├── PROTOCOL.md
-├── WORKER_PLAN.md
-├── .env.example
-├── package.json
-├── server.js
-├── server-sqlite.js
-├── worker-openclaw.js
-├── start-bot-bridge.sh
-├── check-bot-bridge.sh
-├── check-health.sh
-├── monitor-bot-bridge.sh
-├── rotate-bridge-log.sh
-└── systemd/
-    └── bot-bridge.service.example
-```
+## 文档
+- `ARCHITECTURE.md`
+- `PROTOCOL.md`
+- `WORKER_PLAN.md`
+- `TESTING.md`
 
 ---
 
 ## 当前限制
 
-第二轮的 worker 还是最小骨架：
-- 已经打通 bridge 闭环
-- 但本地执行部分还是 mock 形式
-- 下一轮再接真实 OpenClaw agent 调用
+第三轮已经接入真实 OpenClaw CLI 入口，但仍属于最小实现：
+- 真实执行依赖本机 `openclaw` CLI 能正常工作
+- 当前先通过 `openclaw-cli` 模式调用
+- 还未接入更细的 session 管理、节点鉴权和重试策略
 
 ---
 
 ## 推荐下一步
 
 这轮之后，建议继续实现：
-1. 把 `worker-openclaw.js` 接到真实 OpenClaw agent 调用
-2. 增加节点/worker 级鉴权
-3. 增加任务超时与重试策略
-4. 增加 agent 能力声明与路由限制
+1. 更稳定的本地 OpenClaw agent 调用方式
+2. 节点/worker 级鉴权
+3. 任务超时与重试策略
+4. agent 能力声明与路由限制
