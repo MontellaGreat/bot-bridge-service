@@ -21,11 +21,11 @@
 
 当前仓库正在从 v1 的 bot-bridge 形态升级到 v2 方向的 agent bridge。
 
-这第三轮升级主要完成：
-- 增加真实 OpenClaw 调用入口的 worker 版本
-- 在 worker 中支持 `mock` / `openclaw-cli` 两种执行模式
-- 支持真实模式失败时按配置自动降级到 mock
-- 补充完整测试办法，验证 bridge 闭环与真实 agent 执行
+这第四轮升级主要完成：
+- 增加 worker 级独立 token
+- 增加重试 / dead-letter 基础字段与接口
+- 增加 agent 能力声明与能力匹配过滤
+- 强化本地 OpenClaw CLI 适配器（支持多种命令形态尝试）
 
 ---
 
@@ -38,46 +38,53 @@
 - `POST /tasks/:id/claim` 任务签收 / 认领
 - `POST /tasks/:id/status` 更新任务状态
 - `POST /tasks/:id/result` 回写执行结果
+- `POST /tasks/:id/retry` 重试或进入 dead-letter
 - `GET /health` 健康检查
-- Bearer Token 鉴权
+- Bridge Token / Worker Token 鉴权
 - SQLite 持久化
 
-### Worker（第三轮）
+### Worker（第四轮）
 - 轮询属于本节点/本 agent 的 `queued` 任务
+- 按能力声明过滤可处理任务
 - claim 任务
 - 更新 `accepted` / `running`
 - 执行本地 worker 逻辑：
   - `mock`
   - `openclaw-cli`
 - 可选自动降级：`openclaw-cli -> mock`
-- 回写 `done` / `failed`
+- 支持失败后按重试次数自动 retry 或进入 dead-letter
 
 ---
 
-## 文档
-- `ARCHITECTURE.md`
-- `PROTOCOL.md`
-- `WORKER_PLAN.md`
-- `TESTING.md`
-- `CURRENT_TEST_STATUS.md`
-- `REMOTE_OPENCLAW_RUNTIME_TROUBLESHOOTING.md`
+## 新增能力
+
+### 1. Worker 级鉴权
+- `BRIDGE_TOKEN`：主桥接 token
+- `BRIDGE_WORKER_TOKEN`：worker 专用 token
+
+### 2. 重试 / 死信
+任务新增：
+- `retry_count`
+- `max_retries`
+- `dead_letter_reason`
+
+### 3. 能力声明
+worker 可通过：
+- `BRIDGE_WORKER_CAPABILITIES`
+声明自己能处理的任务类型。
+
+任务可通过：
+- `requiredCapabilities`
+声明所需能力。
+
+worker 只会拉取自己能力可覆盖的任务。
 
 ---
 
 ## 当前限制
 
-第三轮已经接入真实 OpenClaw CLI 入口，但仍属于最小实现：
-- 真实执行依赖本机 `openclaw` CLI 能正常工作
-- 当前先通过 `openclaw-cli` 模式调用
-- 自动降级只能保证桥接链路继续工作，不能替代真实 agent 执行
-- 还未接入更细的 session 管理、节点鉴权和重试策略
-
----
-
-## 推荐下一步
-
-这轮之后，建议继续实现：
-1. 更稳定的本地 OpenClaw agent 调用方式
-2. 节点/worker 级鉴权
-3. 任务超时与重试策略
-4. agent 能力声明与路由限制
+第四轮已经把 bridge 从“能跑”推进到“更稳”，但仍不是最终版：
+- 真实执行仍依赖本机 OpenClaw CLI 稳定性
+- 能力匹配还是轻量实现
+- 重试策略还是基础版
+- 还未实现节点注册中心与更细粒度的权限模型

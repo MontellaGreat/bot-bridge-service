@@ -8,6 +8,7 @@ const execFileAsync = promisify(execFile);
 
 const BRIDGE_URL = process.env.BRIDGE_URL || 'http://127.0.0.1:8787';
 const BRIDGE_TOKEN = process.env.BRIDGE_TOKEN || 'change-me';
+const BRIDGE_WORKER_TOKEN = process.env.BRIDGE_WORKER_TOKEN || BRIDGE_TOKEN;
 const BRIDGE_NODE_ID = process.env.BRIDGE_NODE_ID || 'openclaw-node';
 const WORKER_ID = process.env.BRIDGE_WORKER_ID || `${BRIDGE_NODE_ID}-worker`;
 const TARGET_AGENT = process.env.BRIDGE_TARGET_AGENT || 'main';
@@ -17,6 +18,7 @@ const OPENCLAW_BIN = process.env.OPENCLAW_BIN || 'openclaw';
 const OPENCLAW_RUN_TIMEOUT_MS = Number(process.env.OPENCLAW_RUN_TIMEOUT_MS || 30000);
 const WORKER_MODE = process.env.BRIDGE_WORKER_MODE || 'openclaw-cli'; // openclaw-cli | mock
 const FALLBACK_TO_MOCK = String(process.env.BRIDGE_FALLBACK_TO_MOCK || 'false').toLowerCase() === 'true';
+const WORKER_CAPABILITIES = String(process.env.BRIDGE_WORKER_CAPABILITIES || '').split(',').map(s => s.trim()).filter(Boolean);
 
 fs.mkdirSync(RESULT_DIR, { recursive: true });
 
@@ -25,7 +27,7 @@ async function api(pathname, options = {}) {
   const res = await fetch(url, {
     ...options,
     headers: {
-      'Authorization': `Bearer ${BRIDGE_TOKEN}`,
+      'Authorization': `Bearer ${BRIDGE_WORKER_TOKEN}`,
       'Content-Type': 'application/json',
       ...(options.headers || {}),
     },
@@ -37,6 +39,12 @@ async function api(pathname, options = {}) {
   return res.json();
 }
 
+function hasRequiredCapabilities(task) {
+  const required = Array.isArray(task.requiredCapabilities) ? task.requiredCapabilities : [];
+  if (required.length === 0) return true;
+  return required.every(cap => WORKER_CAPABILITIES.includes(cap));
+}
+
 async function listQueuedTasks() {
   const qs = new URLSearchParams({
     target_node: BRIDGE_NODE_ID,
@@ -44,7 +52,8 @@ async function listQueuedTasks() {
     status: 'queued',
   });
   const data = await api(`/tasks?${qs.toString()}`, { method: 'GET' });
-  return data.tasks || [];
+  const tasks = data.tasks || [];
+  return tasks.filter(hasRequiredCapabilities);
 }
 
 async function claimTask(taskId) {
@@ -54,10 +63,10 @@ async function claimTask(taskId) {
   });
 }
 
-async function updateStatus(taskId, status) {
+async function updateStatus(taskId, status, extras = {}) {
   return api(`/tasks/${taskId}/status`, {
     method: 'POST',
-    body: JSON.stringify({ status }),
+    body: JSON.stringify({ status, ...extras }),
   });
 }
 
@@ -66,6 +75,10 @@ async function postResult(taskId, payload) {
     method: 'POST',
     body: JSON.stringify(payload),
   });
+}
+
+async function retryTask(taskId) {
+  return api(`/tasks/${taskId}/retry`, { method: 'POST', body: JSON.stringify({}) });
 }
 
 function writeArtifact(taskId, payload) {
@@ -103,65 +116,70 @@ async function executeMock(task, fallbackReason = null) {
   };
 }
 
+async function tryOpenClawArgs(args) {
+  return execFileAsync(OPENCLAW_BIN, args, {
+    cwd: process.cwd(),
+    timeout: OPENCLAW_RUN_TIMEOUT_MS,
+    maxBuffer: 1024 * 1024,
+    env: process.env,
+  });
+}
+
 async function executeViaOpenClawCli(task) {
   const startedAt = new Date().toISOString();
   const targetAgent = task.targetAgent || task.target || TARGET_AGENT;
   const prompt = task.content || task.title || 'No content provided';
-  const args = ['run', '--agent', targetAgent, prompt];
+  const candidates = [
+    ['run', '--agent', targetAgent, prompt],
+    ['agent', '--agent', targetAgent, '--message', prompt],
+  ];
 
-  let stdout = '';
-  let stderr = '';
-  try {
-    const res = await execFileAsync(OPENCLAW_BIN, args, {
-      cwd: process.cwd(),
-      timeout: OPENCLAW_RUN_TIMEOUT_MS,
-      maxBuffer: 1024 * 1024,
-      env: process.env,
-    });
-    stdout = res.stdout || '';
-    stderr = res.stderr || '';
-  } catch (err) {
-    stdout = err.stdout || '';
-    stderr = err.stderr || '';
-    const artifact = {
-      taskId: task.id,
-      targetAgent,
-      executionMode: 'openclaw-cli',
-      ok: false,
-      error: err.message,
-      stdout,
-      stderr,
-      args,
-    };
-    const artifactPath = writeArtifact(task.id, artifact);
-    const message = `openclaw_cli_failed: ${err.message}; artifact=${artifactPath}`;
-    if (FALLBACK_TO_MOCK) {
-      return executeMock(task, message);
+  let lastError = null;
+  for (const args of candidates) {
+    try {
+      const res = await tryOpenClawArgs(args);
+      const output = {
+        taskId: task.id,
+        targetAgent,
+        executionMode: 'openclaw-cli',
+        ok: true,
+        stdout: res.stdout || '',
+        stderr: res.stderr || '',
+        args,
+      };
+      const artifactPath = writeArtifact(task.id, output);
+      return {
+        resultSummary: `OpenClaw CLI executed task for agent ${targetAgent}`,
+        result: JSON.stringify(output, null, 2),
+        artifactPath,
+        remoteAgent: targetAgent,
+        remoteSessionKey: null,
+        startedAt,
+        finishedAt: new Date().toISOString(),
+        executionMode: 'openclaw-cli',
+        fallbackReason: null,
+      };
+    } catch (err) {
+      lastError = { args, err };
     }
-    throw new Error(message);
   }
 
-  const output = {
+  const artifact = {
     taskId: task.id,
     targetAgent,
     executionMode: 'openclaw-cli',
-    ok: true,
-    stdout,
-    stderr,
-    args,
+    ok: false,
+    triedArgs: candidates,
+    lastError: lastError ? String(lastError.err.message || lastError.err) : 'unknown',
+    stdout: lastError?.err?.stdout || '',
+    stderr: lastError?.err?.stderr || '',
   };
-  const artifactPath = writeArtifact(task.id, output);
-  return {
-    resultSummary: `OpenClaw CLI executed task for agent ${targetAgent}`,
-    result: JSON.stringify(output, null, 2),
-    artifactPath,
-    remoteAgent: targetAgent,
-    remoteSessionKey: null,
-    startedAt,
-    finishedAt: new Date().toISOString(),
-    executionMode: 'openclaw-cli',
-    fallbackReason: null,
-  };
+  const artifactPath = writeArtifact(task.id, artifact);
+  const message = `openclaw_cli_failed: ${artifact.lastError}; artifact=${artifactPath}`;
+  if (FALLBACK_TO_MOCK) {
+    return executeMock(task, message);
+  }
+  throw new Error(message);
 }
 
 async function executeLocally(task) {
@@ -191,20 +209,27 @@ async function handleTask(task) {
     });
     console.log(`[worker] done ${task.id}`);
   } catch (err) {
-    await postResult(task.id, {
-      status: 'failed',
-      resultSummary: 'worker execution failed',
-      result: null,
-      error: String(err && err.message ? err.message : err),
-      remoteAgent: task.targetAgent || task.target,
-      finishedAt: new Date().toISOString(),
-    });
     console.error(`[worker] failed ${task.id}:`, err);
+    const shouldRetry = typeof task.maxRetries === 'number' && (task.retryCount || 0) < task.maxRetries;
+    if (shouldRetry) {
+      await retryTask(task.id);
+    } else {
+      await updateStatus(task.id, 'dead_letter', { deadLetterReason: 'execution_failed' });
+      await postResult(task.id, {
+        status: 'failed',
+        resultSummary: 'worker execution failed',
+        result: null,
+        error: String(err && err.message ? err.message : err),
+        remoteAgent: task.targetAgent || task.target,
+        finishedAt: new Date().toISOString(),
+      });
+    }
   }
 }
 
 async function main() {
   console.log(`[worker] bridge=${BRIDGE_URL} node=${BRIDGE_NODE_ID} targetAgent=${TARGET_AGENT} mode=${WORKER_MODE} fallbackToMock=${FALLBACK_TO_MOCK}`);
+  console.log(`[worker] capabilities=${WORKER_CAPABILITIES.join(',') || '(none declared)'}`);
   while (true) {
     try {
       const tasks = await listQueuedTasks();

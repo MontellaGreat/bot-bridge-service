@@ -8,6 +8,7 @@ const { DatabaseSync } = require('node:sqlite');
 
 const PORT = Number(process.env.BRIDGE_PORT || 8787);
 const TOKEN = process.env.BRIDGE_TOKEN || 'change-me';
+const WORKER_TOKEN = process.env.BRIDGE_WORKER_TOKEN || '';
 const DATA_DIR = process.env.BRIDGE_DATA_DIR || path.join(__dirname, 'data');
 const DB_FILE = process.env.BRIDGE_DB_FILE || path.join(DATA_DIR, 'bridge.sqlite');
 
@@ -30,7 +31,11 @@ CREATE TABLE IF NOT EXISTS tasks (
   complexity TEXT,
   conversation_id TEXT,
   metadata_json TEXT,
+  required_capabilities_json TEXT,
   status TEXT NOT NULL,
+  retry_count INTEGER DEFAULT 0,
+  max_retries INTEGER DEFAULT 0,
+  dead_letter_reason TEXT,
   claimed_by TEXT,
   claimed_at TEXT,
   accepted_at TEXT,
@@ -58,6 +63,10 @@ ensureColumn('target_agent', `ALTER TABLE tasks ADD COLUMN target_agent TEXT`);
 ensureColumn('title', `ALTER TABLE tasks ADD COLUMN title TEXT`);
 ensureColumn('priority', `ALTER TABLE tasks ADD COLUMN priority TEXT`);
 ensureColumn('complexity', `ALTER TABLE tasks ADD COLUMN complexity TEXT`);
+ensureColumn('required_capabilities_json', `ALTER TABLE tasks ADD COLUMN required_capabilities_json TEXT`);
+ensureColumn('retry_count', `ALTER TABLE tasks ADD COLUMN retry_count INTEGER DEFAULT 0`);
+ensureColumn('max_retries', `ALTER TABLE tasks ADD COLUMN max_retries INTEGER DEFAULT 0`);
+ensureColumn('dead_letter_reason', `ALTER TABLE tasks ADD COLUMN dead_letter_reason TEXT`);
 ensureColumn('claimed_by', `ALTER TABLE tasks ADD COLUMN claimed_by TEXT`);
 ensureColumn('claimed_at', `ALTER TABLE tasks ADD COLUMN claimed_at TEXT`);
 ensureColumn('accepted_at', `ALTER TABLE tasks ADD COLUMN accepted_at TEXT`);
@@ -78,17 +87,9 @@ function json(res, status, body) {
   res.end(data);
 }
 
-function notFound(res) {
-  json(res, 404, { error: 'not_found' });
-}
-
-function unauthorized(res) {
-  json(res, 401, { error: 'unauthorized' });
-}
-
-function badRequest(res, message) {
-  json(res, 400, { error: 'bad_request', message });
-}
+function notFound(res) { json(res, 404, { error: 'not_found' }); }
+function unauthorized(res) { json(res, 401, { error: 'unauthorized' }); }
+function badRequest(res, message) { json(res, 400, { error: 'bad_request', message }); }
 
 function getAuthToken(req) {
   const header = req.headers['authorization'] || '';
@@ -96,9 +97,19 @@ function getAuthToken(req) {
   return header.startsWith(prefix) ? header.slice(prefix.length).trim() : '';
 }
 
-function requireAuth(req, res) {
+function requireBridgeAuth(req, res) {
   const token = getAuthToken(req);
   if (!TOKEN || token !== TOKEN) {
+    unauthorized(res);
+    return false;
+  }
+  return true;
+}
+
+function requireWorkerAuth(req, res) {
+  if (!WORKER_TOKEN) return requireBridgeAuth(req, res);
+  const token = getAuthToken(req);
+  if (token !== WORKER_TOKEN) {
     unauthorized(res);
     return false;
   }
@@ -117,11 +128,7 @@ function readBody(req) {
     });
     req.on('end', () => {
       if (!data) return resolve({});
-      try {
-        resolve(JSON.parse(data));
-      } catch (e) {
-        reject(new Error('invalid_json'));
-      }
+      try { resolve(JSON.parse(data)); } catch (e) { reject(new Error('invalid_json')); }
     });
     req.on('error', reject);
   });
@@ -148,7 +155,11 @@ function rowToTask(row) {
     complexity: row.complexity,
     conversationId: row.conversation_id,
     metadata: row.metadata_json ? JSON.parse(row.metadata_json) : {},
+    requiredCapabilities: row.required_capabilities_json ? JSON.parse(row.required_capabilities_json) : [],
     status: row.status,
+    retryCount: row.retry_count || 0,
+    maxRetries: row.max_retries || 0,
+    deadLetterReason: row.dead_letter_reason,
     claimedBy: row.claimed_by,
     claimedAt: row.claimed_at,
     acceptedAt: row.accepted_at,
@@ -165,10 +176,10 @@ function rowToTask(row) {
 const insertStmt = db.prepare(`
 INSERT INTO tasks (
   id, source, target, source_node, source_agent, target_node, target_agent,
-  type, title, content, priority, complexity, conversation_id, metadata_json,
-  status, claimed_by, claimed_at, accepted_at, started_at, finished_at,
+  type, title, content, priority, complexity, conversation_id, metadata_json, required_capabilities_json,
+  status, retry_count, max_retries, dead_letter_reason, claimed_by, claimed_at, accepted_at, started_at, finished_at,
   result_summary, result, error, created_at, updated_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `);
 
 const getStmt = db.prepare(`SELECT * FROM tasks WHERE id = ?`);
@@ -184,7 +195,12 @@ WHERE id = ?
 `);
 const updateStatusStmt = db.prepare(`
 UPDATE tasks
-SET status = ?, accepted_at = COALESCE(?, accepted_at), started_at = COALESCE(?, started_at), updated_at = ?
+SET status = ?, accepted_at = COALESCE(?, accepted_at), started_at = COALESCE(?, started_at), dead_letter_reason = COALESCE(?, dead_letter_reason), updated_at = ?
+WHERE id = ?
+`);
+const retryStmt = db.prepare(`
+UPDATE tasks
+SET retry_count = ?, status = ?, dead_letter_reason = ?, updated_at = ?
 WHERE id = ?
 `);
 
@@ -196,7 +212,8 @@ const server = http.createServer(async (req, res) => {
     return json(res, 200, { ok: true, service: 'openclaw-agent-bridge', db: DB_FILE, time: now() });
   }
 
-  if (!requireAuth(req, res)) return;
+  const isWorkerRoute = /\/claim$|\/status$|\/result$|\/retry$/.test(pathname);
+  if (!(isWorkerRoute ? requireWorkerAuth(req, res) : requireBridgeAuth(req, res))) return;
 
   if (req.method === 'POST' && pathname === '/tasks') {
     try {
@@ -222,7 +239,11 @@ const server = http.createServer(async (req, res) => {
         complexity: body.complexity || null,
         conversationId: body.conversationId || body.conversation_id || null,
         metadata: body.metadata || {},
+        requiredCapabilities: body.requiredCapabilities || body.required_capabilities || [],
         status: body.status || 'queued',
+        retryCount: 0,
+        maxRetries: Number(body.maxRetries ?? body.max_retries ?? 0),
+        deadLetterReason: null,
         claimedBy: null,
         claimedAt: null,
         acceptedAt: null,
@@ -235,31 +256,12 @@ const server = http.createServer(async (req, res) => {
         updatedAt: now(),
       };
       insertStmt.run(
-        task.id,
-        task.source,
-        task.target,
-        task.sourceNode,
-        task.sourceAgent,
-        task.targetNode,
-        task.targetAgent,
-        task.type,
-        task.title,
-        task.content,
-        task.priority,
-        task.complexity,
-        task.conversationId,
-        JSON.stringify(task.metadata || {}),
-        task.status,
-        task.claimedBy,
-        task.claimedAt,
-        task.acceptedAt,
-        task.startedAt,
-        task.finishedAt,
-        task.resultSummary,
-        task.result,
-        task.error,
-        task.createdAt,
-        task.updatedAt
+        task.id, task.source, task.target, task.sourceNode, task.sourceAgent, task.targetNode, task.targetAgent,
+        task.type, task.title, task.content, task.priority, task.complexity, task.conversationId,
+        JSON.stringify(task.metadata || {}), JSON.stringify(task.requiredCapabilities || []),
+        task.status, task.retryCount, task.maxRetries, task.deadLetterReason, task.claimedBy, task.claimedAt,
+        task.acceptedAt, task.startedAt, task.finishedAt, task.resultSummary, task.result, task.error,
+        task.createdAt, task.updatedAt
       );
       return json(res, 201, task);
     } catch (e) {
@@ -277,21 +279,11 @@ const server = http.createServer(async (req, res) => {
         params.push(url.searchParams.get(key));
       }
     }
-    if (url.searchParams.get('target_node')) {
-      where.push('target_node = ?');
-      params.push(url.searchParams.get('target_node'));
-    }
-    if (url.searchParams.get('target_agent')) {
-      where.push('target_agent = ?');
-      params.push(url.searchParams.get('target_agent'));
-    }
-    if (url.searchParams.get('source_node')) {
-      where.push('source_node = ?');
-      params.push(url.searchParams.get('source_node'));
-    }
-    if (url.searchParams.get('source_agent')) {
-      where.push('source_agent = ?');
-      params.push(url.searchParams.get('source_agent'));
+    for (const key of ['target_node', 'target_agent', 'source_node', 'source_agent']) {
+      if (url.searchParams.get(key)) {
+        where.push(`${key} = ?`);
+        params.push(url.searchParams.get(key));
+      }
     }
     const sql = `SELECT * FROM tasks ${where.length ? 'WHERE ' + where.join(' AND ') : ''} ORDER BY created_at DESC`;
     const rows = db.prepare(sql).all(...params);
@@ -314,8 +306,7 @@ const server = http.createServer(async (req, res) => {
       const claimedBy = body.claimedBy || body.claimed_by || body.worker || 'unknown-worker';
       const claimedAt = now();
       claimStmt.run('claimed', claimedBy, claimedAt, claimedAt, claimMatch[1]);
-      const row = getStmt.get(claimMatch[1]);
-      return json(res, 200, rowToTask(row));
+      return json(res, 200, rowToTask(getStmt.get(claimMatch[1])));
     } catch (e) {
       return badRequest(res, e.message);
     }
@@ -332,9 +323,8 @@ const server = http.createServer(async (req, res) => {
       const acceptedAt = newStatus === 'accepted' ? now() : null;
       const startedAt = newStatus === 'running' ? now() : null;
       const updatedAt = now();
-      updateStatusStmt.run(newStatus, acceptedAt, startedAt, updatedAt, statusMatch[1]);
-      const row = getStmt.get(statusMatch[1]);
-      return json(res, 200, rowToTask(row));
+      updateStatusStmt.run(newStatus, acceptedAt, startedAt, body.deadLetterReason || body.dead_letter_reason || null, updatedAt, statusMatch[1]);
+      return json(res, 200, rowToTask(getStmt.get(statusMatch[1])));
     } catch (e) {
       return badRequest(res, e.message);
     }
@@ -356,8 +346,26 @@ const server = http.createServer(async (req, res) => {
         finishedAt,
         resultMatch[1]
       );
-      const row = getStmt.get(resultMatch[1]);
-      return json(res, 200, rowToTask(row));
+      return json(res, 200, rowToTask(getStmt.get(resultMatch[1])));
+    } catch (e) {
+      return badRequest(res, e.message);
+    }
+  }
+
+  const retryMatch = pathname.match(/^\/tasks\/([^/]+)\/retry$/);
+  if (req.method === 'POST' && retryMatch) {
+    try {
+      const existing = getStmt.get(retryMatch[1]);
+      if (!existing) return notFound(res);
+      const nextRetry = (existing.retry_count || 0) + 1;
+      const maxRetries = existing.max_retries || 0;
+      const updatedAt = now();
+      if (nextRetry > maxRetries) {
+        retryStmt.run(nextRetry, 'dead_letter', 'max_retries_exceeded', updatedAt, retryMatch[1]);
+      } else {
+        retryStmt.run(nextRetry, 'queued', null, updatedAt, retryMatch[1]);
+      }
+      return json(res, 200, rowToTask(getStmt.get(retryMatch[1])));
     } catch (e) {
       return badRequest(res, e.message);
     }
