@@ -1,12 +1,13 @@
 {
   "name": "bot-bridge-service",
-  "version": "1.0.0",
+  "version": "2.0.0-alpha.1",
   "private": true,
-  "description": "Minimal bridge service for bot-to-bot relay with no external dependencies",
+  "description": "Lightweight cross-OpenClaw agent task bridge with SQLite persistence",
   "main": "server-sqlite.js",
   "scripts": {
     "start": "node server-sqlite.js",
     "start:json": "node server.js",
-    "start:sqlite": "node server-sqlite.js"
+    "start:sqlite": "node server-sqlite.js",
+    "start:worker": "node worker-openclaw.js"
   }
 }
