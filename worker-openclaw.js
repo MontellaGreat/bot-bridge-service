@@ -13,12 +13,17 @@ const BRIDGE_NODE_ID = process.env.BRIDGE_NODE_ID || 'openclaw-node';
 const WORKER_ID = process.env.BRIDGE_WORKER_ID || `${BRIDGE_NODE_ID}-worker`;
 const TARGET_AGENT = process.env.BRIDGE_TARGET_AGENT || 'main';
 const POLL_INTERVAL_MS = Number(process.env.BRIDGE_POLL_INTERVAL_MS || 5000);
+const HEARTBEAT_INTERVAL_MS = Number(process.env.BRIDGE_HEARTBEAT_INTERVAL_MS || 15000);
 const RESULT_DIR = process.env.BRIDGE_RESULT_DIR || path.join(__dirname, 'data', 'worker-results');
 const OPENCLAW_BIN = process.env.OPENCLAW_BIN || 'openclaw';
 const OPENCLAW_RUN_TIMEOUT_MS = Number(process.env.OPENCLAW_RUN_TIMEOUT_MS || 30000);
-const WORKER_MODE = process.env.BRIDGE_WORKER_MODE || 'openclaw-cli'; // openclaw-cli | mock
+const WORKER_MODE = process.env.BRIDGE_WORKER_MODE || 'openclaw-cli';
 const FALLBACK_TO_MOCK = String(process.env.BRIDGE_FALLBACK_TO_MOCK || 'false').toLowerCase() === 'true';
 const WORKER_CAPABILITIES = String(process.env.BRIDGE_WORKER_CAPABILITIES || '').split(',').map(s => s.trim()).filter(Boolean);
+
+let currentTaskId = null;
+let currentWorkerStatus = 'idle';
+let heartbeatTimer = null;
 
 fs.mkdirSync(RESULT_DIR, { recursive: true });
 
@@ -37,6 +42,36 @@ async function api(pathname, options = {}) {
     throw new Error(`HTTP ${res.status}: ${text}`);
   }
   return res.json();
+}
+
+async function sendHeartbeat(status = currentWorkerStatus, taskId = currentTaskId) {
+  currentWorkerStatus = status;
+  currentTaskId = taskId || null;
+  return api('/workers/heartbeat', {
+    method: 'POST',
+    body: JSON.stringify({
+      workerId: WORKER_ID,
+      nodeId: BRIDGE_NODE_ID,
+      targetAgent: TARGET_AGENT,
+      capabilities: WORKER_CAPABILITIES,
+      mode: WORKER_MODE,
+      status: currentWorkerStatus,
+      currentTaskId: currentTaskId,
+      metadata: {
+        pollIntervalMs: POLL_INTERVAL_MS,
+        heartbeatIntervalMs: HEARTBEAT_INTERVAL_MS,
+        fallbackToMock: FALLBACK_TO_MOCK,
+      },
+    }),
+  });
+}
+
+function startHeartbeatLoop() {
+  heartbeatTimer = setInterval(() => {
+    sendHeartbeat().catch(err => {
+      console.error('[worker] heartbeat error:', err.message || err);
+    });
+  }, HEARTBEAT_INTERVAL_MS);
 }
 
 function hasRequiredCapabilities(task) {
@@ -190,6 +225,7 @@ async function executeLocally(task) {
 async function handleTask(task) {
   console.log(`[worker] claiming ${task.id}`);
   await claimTask(task.id);
+  await sendHeartbeat('busy', task.id);
   await updateStatus(task.id, 'accepted');
   await updateStatus(task.id, 'running');
   try {
@@ -224,12 +260,16 @@ async function handleTask(task) {
         finishedAt: new Date().toISOString(),
       });
     }
+  } finally {
+    await sendHeartbeat('idle', null).catch(() => {});
   }
 }
 
 async function main() {
   console.log(`[worker] bridge=${BRIDGE_URL} node=${BRIDGE_NODE_ID} targetAgent=${TARGET_AGENT} mode=${WORKER_MODE} fallbackToMock=${FALLBACK_TO_MOCK}`);
   console.log(`[worker] capabilities=${WORKER_CAPABILITIES.join(',') || '(none declared)'}`);
+  await sendHeartbeat('idle', null);
+  startHeartbeatLoop();
   while (true) {
     try {
       const tasks = await listQueuedTasks();
@@ -247,5 +287,6 @@ async function main() {
 
 main().catch(err => {
   console.error(err);
+  if (heartbeatTimer) clearInterval(heartbeatTimer);
   process.exit(1);
 });
