@@ -13,24 +13,57 @@ const DB_FILE = process.env.BRIDGE_DB_FILE || path.join(DATA_DIR, 'bridge.sqlite
 
 fs.mkdirSync(DATA_DIR, { recursive: true });
 const db = new DatabaseSync(DB_FILE);
+
 db.exec(`
 CREATE TABLE IF NOT EXISTS tasks (
   id TEXT PRIMARY KEY,
-  source TEXT NOT NULL,
-  target TEXT NOT NULL,
+  source TEXT,
+  target TEXT,
+  source_node TEXT,
+  source_agent TEXT,
+  target_node TEXT,
+  target_agent TEXT,
   type TEXT NOT NULL,
+  title TEXT,
   content TEXT,
+  priority TEXT,
+  complexity TEXT,
   conversation_id TEXT,
   metadata_json TEXT,
   status TEXT NOT NULL,
+  claimed_by TEXT,
+  claimed_at TEXT,
+  accepted_at TEXT,
+  started_at TEXT,
+  finished_at TEXT,
+  result_summary TEXT,
   result TEXT,
   error TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_tasks_target_status ON tasks(target, status);
-CREATE INDEX IF NOT EXISTS idx_tasks_source ON tasks(source);
+CREATE INDEX IF NOT EXISTS idx_tasks_target_node_agent_status ON tasks(target_node, target_agent, status);
+CREATE INDEX IF NOT EXISTS idx_tasks_source_node_agent ON tasks(source_node, source_agent);
 `);
+
+const existingColumns = db.prepare(`PRAGMA table_info(tasks)`).all().map(r => r.name);
+function ensureColumn(name, sql) {
+  if (!existingColumns.includes(name)) db.exec(sql);
+}
+ensureColumn('source_node', `ALTER TABLE tasks ADD COLUMN source_node TEXT`);
+ensureColumn('source_agent', `ALTER TABLE tasks ADD COLUMN source_agent TEXT`);
+ensureColumn('target_node', `ALTER TABLE tasks ADD COLUMN target_node TEXT`);
+ensureColumn('target_agent', `ALTER TABLE tasks ADD COLUMN target_agent TEXT`);
+ensureColumn('title', `ALTER TABLE tasks ADD COLUMN title TEXT`);
+ensureColumn('priority', `ALTER TABLE tasks ADD COLUMN priority TEXT`);
+ensureColumn('complexity', `ALTER TABLE tasks ADD COLUMN complexity TEXT`);
+ensureColumn('claimed_by', `ALTER TABLE tasks ADD COLUMN claimed_by TEXT`);
+ensureColumn('claimed_at', `ALTER TABLE tasks ADD COLUMN claimed_at TEXT`);
+ensureColumn('accepted_at', `ALTER TABLE tasks ADD COLUMN accepted_at TEXT`);
+ensureColumn('started_at', `ALTER TABLE tasks ADD COLUMN started_at TEXT`);
+ensureColumn('finished_at', `ALTER TABLE tasks ADD COLUMN finished_at TEXT`);
+ensureColumn('result_summary', `ALTER TABLE tasks ADD COLUMN result_summary TEXT`);
 
 function now() {
   return new Date().toISOString();
@@ -104,11 +137,24 @@ function rowToTask(row) {
     id: row.id,
     source: row.source,
     target: row.target,
+    sourceNode: row.source_node,
+    sourceAgent: row.source_agent,
+    targetNode: row.target_node,
+    targetAgent: row.target_agent,
     type: row.type,
+    title: row.title,
     content: row.content,
+    priority: row.priority,
+    complexity: row.complexity,
     conversationId: row.conversation_id,
     metadata: row.metadata_json ? JSON.parse(row.metadata_json) : {},
     status: row.status,
+    claimedBy: row.claimed_by,
+    claimedAt: row.claimed_at,
+    acceptedAt: row.accepted_at,
+    startedAt: row.started_at,
+    finishedAt: row.finished_at,
+    resultSummary: row.result_summary,
     result: row.result,
     error: row.error,
     createdAt: row.created_at,
@@ -118,15 +164,27 @@ function rowToTask(row) {
 
 const insertStmt = db.prepare(`
 INSERT INTO tasks (
-  id, source, target, type, content, conversation_id, metadata_json,
-  status, result, error, created_at, updated_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  id, source, target, source_node, source_agent, target_node, target_agent,
+  type, title, content, priority, complexity, conversation_id, metadata_json,
+  status, claimed_by, claimed_at, accepted_at, started_at, finished_at,
+  result_summary, result, error, created_at, updated_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `);
 
 const getStmt = db.prepare(`SELECT * FROM tasks WHERE id = ?`);
 const updateResultStmt = db.prepare(`
 UPDATE tasks
-SET status = ?, result = ?, error = ?, updated_at = ?
+SET status = ?, result_summary = ?, result = ?, error = ?, finished_at = ?, updated_at = ?
+WHERE id = ?
+`);
+const claimStmt = db.prepare(`
+UPDATE tasks
+SET status = ?, claimed_by = ?, claimed_at = ?, updated_at = ?
+WHERE id = ?
+`);
+const updateStatusStmt = db.prepare(`
+UPDATE tasks
+SET status = ?, accepted_at = COALESCE(?, accepted_at), started_at = COALESCE(?, started_at), updated_at = ?
 WHERE id = ?
 `);
 
@@ -135,7 +193,7 @@ const server = http.createServer(async (req, res) => {
   const pathname = url.pathname;
 
   if (req.method === 'GET' && pathname === '/health') {
-    return json(res, 200, { ok: true, service: 'bot-bridge-sqlite', db: DB_FILE, time: now() });
+    return json(res, 200, { ok: true, service: 'openclaw-agent-bridge', db: DB_FILE, time: now() });
   }
 
   if (!requireAuth(req, res)) return;
@@ -143,18 +201,34 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'POST' && pathname === '/tasks') {
     try {
       const body = await readBody(req);
-      if (!body.target || !body.type) {
-        return badRequest(res, 'target and type are required');
+      const target = body.target || body.targetAgent || body.target_agent;
+      const targetNode = body.targetNode || body.target_node || null;
+      const targetAgent = body.targetAgent || body.target_agent || body.target || null;
+      if (!target && !(targetNode && targetAgent)) {
+        return badRequest(res, 'target or targetNode+targetAgent are required');
       }
       const task = {
         id: newId(),
         source: body.source || 'unknown',
-        target: body.target,
-        type: body.type,
+        target: body.target || targetAgent || 'unknown',
+        sourceNode: body.sourceNode || body.source_node || null,
+        sourceAgent: body.sourceAgent || body.source_agent || body.source || null,
+        targetNode,
+        targetAgent,
+        type: body.type || 'delegated_work',
+        title: body.title || null,
         content: body.content || '',
-        conversationId: body.conversationId || null,
+        priority: body.priority || 'normal',
+        complexity: body.complexity || null,
+        conversationId: body.conversationId || body.conversation_id || null,
         metadata: body.metadata || {},
-        status: 'pending',
+        status: body.status || 'queued',
+        claimedBy: null,
+        claimedAt: null,
+        acceptedAt: null,
+        startedAt: null,
+        finishedAt: null,
+        resultSummary: null,
         result: null,
         error: null,
         createdAt: now(),
@@ -164,11 +238,24 @@ const server = http.createServer(async (req, res) => {
         task.id,
         task.source,
         task.target,
+        task.sourceNode,
+        task.sourceAgent,
+        task.targetNode,
+        task.targetAgent,
         task.type,
+        task.title,
         task.content,
+        task.priority,
+        task.complexity,
         task.conversationId,
         JSON.stringify(task.metadata || {}),
         task.status,
+        task.claimedBy,
+        task.claimedAt,
+        task.acceptedAt,
+        task.startedAt,
+        task.finishedAt,
+        task.resultSummary,
         task.result,
         task.error,
         task.createdAt,
@@ -183,21 +270,28 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'GET' && pathname === '/tasks') {
     const params = [];
     const where = [];
-    if (url.searchParams.get('target')) {
-      where.push('target = ?');
-      params.push(url.searchParams.get('target'));
+    const filters = ['target', 'source', 'status', 'type'];
+    for (const key of filters) {
+      if (url.searchParams.get(key)) {
+        where.push(`${key} = ?`);
+        params.push(url.searchParams.get(key));
+      }
     }
-    if (url.searchParams.get('source')) {
-      where.push('source = ?');
-      params.push(url.searchParams.get('source'));
+    if (url.searchParams.get('target_node')) {
+      where.push('target_node = ?');
+      params.push(url.searchParams.get('target_node'));
     }
-    if (url.searchParams.get('status')) {
-      where.push('status = ?');
-      params.push(url.searchParams.get('status'));
+    if (url.searchParams.get('target_agent')) {
+      where.push('target_agent = ?');
+      params.push(url.searchParams.get('target_agent'));
     }
-    if (url.searchParams.get('type')) {
-      where.push('type = ?');
-      params.push(url.searchParams.get('type'));
+    if (url.searchParams.get('source_node')) {
+      where.push('source_node = ?');
+      params.push(url.searchParams.get('source_node'));
+    }
+    if (url.searchParams.get('source_agent')) {
+      where.push('source_agent = ?');
+      params.push(url.searchParams.get('source_agent'));
     }
     const sql = `SELECT * FROM tasks ${where.length ? 'WHERE ' + where.join(' AND ') : ''} ORDER BY created_at DESC`;
     const rows = db.prepare(sql).all(...params);
@@ -211,18 +305,55 @@ const server = http.createServer(async (req, res) => {
     return json(res, 200, rowToTask(row));
   }
 
+  const claimMatch = pathname.match(/^\/tasks\/([^/]+)\/claim$/);
+  if (req.method === 'POST' && claimMatch) {
+    try {
+      const body = await readBody(req);
+      const existing = getStmt.get(claimMatch[1]);
+      if (!existing) return notFound(res);
+      const claimedBy = body.claimedBy || body.claimed_by || body.worker || 'unknown-worker';
+      const claimedAt = now();
+      claimStmt.run('claimed', claimedBy, claimedAt, claimedAt, claimMatch[1]);
+      const row = getStmt.get(claimMatch[1]);
+      return json(res, 200, rowToTask(row));
+    } catch (e) {
+      return badRequest(res, e.message);
+    }
+  }
+
+  const statusMatch = pathname.match(/^\/tasks\/([^/]+)\/status$/);
+  if (req.method === 'POST' && statusMatch) {
+    try {
+      const body = await readBody(req);
+      const existing = getStmt.get(statusMatch[1]);
+      if (!existing) return notFound(res);
+      const newStatus = body.status;
+      if (!newStatus) return badRequest(res, 'status is required');
+      const acceptedAt = newStatus === 'accepted' ? now() : null;
+      const startedAt = newStatus === 'running' ? now() : null;
+      const updatedAt = now();
+      updateStatusStmt.run(newStatus, acceptedAt, startedAt, updatedAt, statusMatch[1]);
+      const row = getStmt.get(statusMatch[1]);
+      return json(res, 200, rowToTask(row));
+    } catch (e) {
+      return badRequest(res, e.message);
+    }
+  }
+
   const resultMatch = pathname.match(/^\/tasks\/([^/]+)\/result$/);
   if (req.method === 'POST' && resultMatch) {
     try {
       const body = await readBody(req);
       const existing = getStmt.get(resultMatch[1]);
       if (!existing) return notFound(res);
-      const updatedAt = now();
+      const finishedAt = now();
       updateResultStmt.run(
         body.status || 'done',
+        body.resultSummary ?? body.result_summary ?? null,
         body.result ?? null,
         body.error ?? null,
-        updatedAt,
+        finishedAt,
+        finishedAt,
         resultMatch[1]
       );
       const row = getStmt.get(resultMatch[1]);
@@ -236,6 +367,6 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`bot-bridge-sqlite listening on :${PORT}`);
+  console.log(`openclaw-agent-bridge listening on :${PORT}`);
   console.log(`db file: ${DB_FILE}`);
 });
