@@ -1,0 +1,20 @@
+[Unit]
+Description=OpenClaw Agent Bridge Worker
+After=network.target bot-bridge.service
+Wants=bot-bridge.service
+
+[Service]
+Type=simple
+User=admin
+WorkingDirectory=/home/admin/.openclaw/workspace/projects/bot-bridge-service
+EnvironmentFile=/home/admin/.openclaw/workspace/projects/bot-bridge-service/.env
+Environment=BRIDGE_URL=http://127.0.0.1:8787
+Environment=BRIDGE_TARGET_AGENT=main
+Environment=BRIDGE_WORKER_ID=openclaw-node-a-worker
+Environment=BRIDGE_WORKER_MODE=mock
+ExecStart=/usr/bin/node /home/admin/.openclaw/workspace/projects/bot-bridge-service/worker-openclaw.js
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
