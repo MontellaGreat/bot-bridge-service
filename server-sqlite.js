@@ -437,6 +437,102 @@ function getControlActiveTasks(limit = 100) {
   return { count: tasks.length, tasks };
 }
 
+function countMatchingQueuedTasks(worker) {
+  if (!worker?.nodeId || !worker?.targetAgent) return 0;
+  return db.prepare(`SELECT COUNT(*) AS c FROM tasks WHERE status = 'queued' AND target_node = ? AND target_agent = ?`).get(worker.nodeId, worker.targetAgent).c;
+}
+
+function toStaffEntry(row) {
+  const agent = rowToControlAgent(row);
+  if (!agent) return null;
+  let nextStateHint = 'waiting';
+  if (agent.health === 'offline') nextStateHint = 'offline';
+  else if (agent.health === 'stale') nextStateHint = 'stale';
+  else if (agent.status === 'busy' || agent.currentTaskId || agent.lastTaskStatus === 'running') nextStateHint = 'working';
+  else if (countMatchingQueuedTasks(agent) > 0) nextStateHint = 'next-up';
+  return { ...agent, nextStateHint };
+}
+
+function getControlStaff() {
+  const rows = db.prepare(`SELECT * FROM workers ORDER BY updated_at DESC`).all();
+  const staff = rows.map(toStaffEntry).filter(Boolean);
+  return { count: staff.length, staff };
+}
+
+function getRecentErrors(limit = 20) {
+  const rows = db.prepare(`
+    SELECT * FROM tasks
+    WHERE error IS NOT NULL OR status IN ('failed', 'dead_letter')
+    ORDER BY updated_at DESC
+    LIMIT ?
+  `).all(limit);
+  return rows.map(rowToTask).map(task => ({
+    taskId: task.id,
+    targetNode: task.targetNode,
+    targetAgent: task.targetAgent,
+    status: task.status,
+    error: task.error,
+    deadLetterReason: task.deadLetterReason,
+    claimedBy: task.claimedBy,
+    updatedAt: task.updatedAt,
+  }));
+}
+
+function getControlOverview() {
+  const summary = getControlSummary();
+  const staff = getControlStaff().staff;
+  const busyWorkers = staff.filter(s => s.nextStateHint === 'working').length;
+  const idleWorkers = staff.filter(s => s.nextStateHint === 'waiting' || s.nextStateHint === 'next-up').length;
+  const recentFailures = getRecentErrors(5).length;
+  const risks = [];
+  if (CONTROL_TOKEN === TOKEN) risks.push({ level: 'warn', code: 'control_uses_bridge_token', message: 'Control API currently reuses BRIDGE_TOKEN.' });
+  if ((summary.counts.deadLetterTasks || 0) > 0) risks.push({ level: 'warn', code: 'dead_letter_present', message: `${summary.counts.deadLetterTasks} dead-letter task(s) present.` });
+  if (staff.some(s => s.health === 'offline')) risks.push({ level: 'warn', code: 'offline_workers', message: 'Some workers are offline.' });
+  const attention = [];
+  if ((summary.counts.runningTasks || 0) > 0) attention.push({ type: 'task', message: `${summary.counts.runningTasks} task(s) currently running.` });
+  if ((summary.counts.queuedTasks || 0) > 0) attention.push({ type: 'queue', message: `${summary.counts.queuedTasks} task(s) waiting in queue.` });
+  return {
+    ok: true,
+    status: risks.some(r => r.level === 'warn') ? 'attention' : 'healthy',
+    summary: {
+      onlineWorkers: summary.counts.onlineWorkers,
+      busyWorkers,
+      idleWorkers,
+      queuedTasks: summary.counts.queuedTasks,
+      runningTasks: summary.counts.runningTasks,
+      deadLetterTasks: summary.counts.deadLetterTasks,
+      recentFailures,
+    },
+    risks,
+    attention,
+    staff: staff.slice(0, 10).map(({ workerId, nodeId, targetAgent, status, currentTaskId, nextStateHint }) => ({ workerId, nodeId, targetAgent, status, currentTaskId, nextStateHint })),
+    updatedAt: now(),
+  };
+}
+
+function getControlWiring() {
+  const summary = getControlSummary();
+  const agents = getControlAgents().agents;
+  const realCliSeen = agents.some(a => a.mode === 'openclaw-cli');
+  return {
+    ok: true,
+    wiring: {
+      bridgeHealth: 'connected',
+      controlToken: CONTROL_TOKEN ? 'configured' : 'missing',
+      workerHeartbeat: summary.counts.workers > 0 ? 'connected' : 'missing',
+      workerRoster: summary.counts.workers > 0 ? 'connected' : 'missing',
+      realCliExecution: realCliSeen ? 'connected' : 'partial',
+      deadLetterWatcher: 'connected',
+      usageData: 'not_provided_by_bridge',
+      memoryDocs: 'not_provided_by_bridge',
+    },
+    notes: [
+      'This bridge provides execution and worker observability only.',
+      'Usage / subscription / memory / docs remain upstream control-center data sources.',
+    ],
+  };
+}
+
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
   const pathname = url.pathname;
@@ -516,6 +612,21 @@ const server = http.createServer(async (req, res) => {
     if (!requireControlAuth(req, res)) return;
     const limit = Number(url.searchParams.get('limit') || 100);
     return json(res, 200, getControlActiveTasks(limit));
+  }
+
+  if (req.method === 'GET' && pathname === '/control/overview') {
+    if (!requireControlAuth(req, res)) return;
+    return json(res, 200, getControlOverview());
+  }
+
+  if (req.method === 'GET' && pathname === '/control/staff') {
+    if (!requireControlAuth(req, res)) return;
+    return json(res, 200, getControlStaff());
+  }
+
+  if (req.method === 'GET' && pathname === '/control/settings/wiring') {
+    if (!requireControlAuth(req, res)) return;
+    return json(res, 200, getControlWiring());
   }
 
   const isWorkerRoute = /\/claim$|\/status$|\/result$|\/retry$/.test(pathname);

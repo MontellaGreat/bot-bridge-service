@@ -1,311 +1,230 @@
 # CONTROL_CENTER_API_PLAN.md
 
-# 第十三轮设计文档：Bridge 状态 API for OpenClaw Control Center
+# 第十三轮设计文档：Bridge 状态 API for TianyiDataScience/openclaw-control-center
 
 ## 目标
 
-在当前 `bot-bridge-service` 项目中新增一组 **控制中心友好型状态接口**，让 `openclaw-control-center` 能读取远端 bridge / node / worker / agent / task 的状态，并用于展示远端执行面板。
+在当前 `bot-bridge-service` 项目中新增一组 **面向 `openclaw-control-center` 的状态接口**，
+让控制面板可以读取远端 bridge / worker / task 的观测状态，并把这些状态映射到它自己的页面：
+
+- 总览
+- 用量（本轮仅提供 bridge 侧可见基础信号，不伪造费用数据）
+- 员工
+- 任务
+- 文档 / 记忆（本轮不由 bridge 提供）
+- 设置
 
 一句话：
 
-> 让 bridge 从“派单总线”升级为“可观测的远端 agent 状态后端”。
+> 让 bridge 成为 `openclaw-control-center` 的“远端执行观测后端”。
 
 ---
 
-## 一、调研结论：OpenClaw Control Center 目前能看什么
+## 一、先纠偏：本轮参照的控制面板到底是谁
 
-本次调研基于：
-- `/opt/openclaw/docs/zh-CN/web/control-ui.md`
-- `/opt/openclaw/docs/zh-CN/web/dashboard.md`
-- `/opt/openclaw/ui/src/ui/controllers/*.ts`
-- `/opt/openclaw/ui/src/ui/views/*.ts`
+本轮确认的目标项目是：
+- `https://github.com/TianyiDataScience/openclaw-control-center`
 
-### Control Center / 控制 UI 当前已有能力
+它**不是** OpenClaw 自带的 Gateway Control UI / Dashboard。
 
-当前控制 UI（Gateway 提供的浏览器管理界面）至少覆盖这些视图：
+这很重要，因为两者的页面模型不同：
 
-1. **Overview / Status / Health**
-   - 网关状态
-   - 健康检查
-   - 快速概览
+### OpenClaw 自带 Control UI 更偏：
+- gateway / channels / sessions / nodes / config / logs
 
-2. **Instances**
-   - 在线实例列表
-   - presence / system-presence
+### 这个 `openclaw-control-center` 更偏：
+- 总览
+- 用量
+- 员工
+- 任务
+- 文档
+- 记忆
+- 设置
 
-3. **Sessions**
-   - 会话列表
-   - 会话状态
-   - 会话级调试信息
+而且它强调：
+- 面向非技术用户
+- 安全优先、默认只读
+- 不直接暴露原始 payload
+- 更关注“谁在工作、谁卡住了、哪些任务有证据、哪些数据没接好”
 
-4. **Agents**
-   - agent 列表
-   - agent identity
-   - files / tools / skills / channels / cron 等面板
-
-5. **Nodes**
-   - 节点列表
-   - 节点能力
-
-6. **Cron / Skills / Logs / Approvals / Config / Models / Update**
-   - 各类运维和管理数据
-
-### 对第十三轮的启发
-
-Control Center 是一个**管理界面**，它天然偏好：
-- 总览页数据（summary）
-- 列表页数据（nodes / agents / sessions）
-- 详情页数据（单节点 / 单 worker / 单任务）
-- 最近活动 / 最近错误 / 活跃任务
-- 健康与在线状态
-
-因此 bridge 新接口不能只吐原始表数据，而应该提供：
-- **总览聚合**
-- **节点聚合**
-- **agent / worker 聚合**
-- **活跃任务聚合**
-- **最近异常 / 最近任务聚合**
+因此 bridge API 设计必须按**这个控制面板的页面语义**来做。
 
 ---
 
-## 二、核心定义：当前项目里“远端 agent 状态”到底指什么
+## 二、调研结论：这个 control-center 现在想看什么
 
-在当前 bridge 架构中，bridge 直接掌握的不是 OpenClaw 内核 agent runtime 的完整内部状态，
-而是以下三类外部可观测状态：
+根据该项目 README，可明确反推出这些页面诉求：
 
-1. **worker 心跳状态**
-2. **worker 当前任务状态**
-3. **该 worker 最近执行结果 / 最近错误 / 最近活动**
+## 1. 总览（Overview）
+要回答一句话：
+> OpenClaw 现在整体正常吗？
 
-因此本轮设计统一定义：
+需要数据：
+- 系统状态
+- 待处理事项
+- 关键风险
+- 运行异常
+- 停滞执行
+- 谁在忙
+- 哪些地方需要优先关注
 
-> **远端 agent 状态 = bridge 侧观察到的 worker 代理状态 + 最近任务执行状态 + 心跳在线状态**
+## 2. 用量（Usage）
+bridge 本轮不能伪造真实 token / 花费 / 订阅数据，但可以补充：
+- bridge 任务吞吐
+- 活跃任务压力
+- 死信数量
+- 失败数
+- 当前“上下文压力”的替代提示（如 running task count）
 
-这个定义足够真实、可落地、且与当前 Control Center 的展示习惯兼容。
+本轮只提供 bridge 可见部分，control-center 应将其标记为“部分接线”。
 
----
+## 3. 员工（Staff）
+这里最关键，和 bridge 高度契合。
 
-## 三、设计原则
-
-### 1. 不破坏现有底层协议
-保留现有接口：
-- `/health`
-- `/workers`
-- `/workers/:id`
-- `/tasks`
-- `/tasks/:id`
-- `/maintenance/reap-timeouts`
-
-这些继续面向 bridge 原生能力。
-
-### 2. 新增控制中心聚合层
-Control Center 不直接拼表，而是读取：
-- `/control/summary`
-- `/control/nodes`
-- `/control/nodes/:nodeId`
-- `/control/agents`
-- `/control/agents/:workerId`
-- `/control/tasks/active`
-- `/control/tasks/recent`
-- `/control/errors/recent`
-
-### 3. 接口字段偏“面板可展示”
-字段命名应尽量稳定、可读、面向 UI，不要逼前端自己推导。
-
-### 4. 单独控制面鉴权
-建议新增：
-- `BRIDGE_CONTROL_TOKEN`
-
-如果未配置，则可退回使用 `BRIDGE_TOKEN`。
-
----
-
-## 四、Control Center 最关心的展示维度
-
-结合当前 Control Center 的 UI 结构，建议 bridge 状态 API 至少提供这些维度：
-
-### A. Summary 卡片需要
-- 总节点数
-- 总 worker 数
-- 在线 worker 数
-- 活跃任务数
-- queued 数
-- running 数
-- dead-letter 数
-- 最近更新时间
-
-### B. Nodes 列表需要
-- nodeId
-- label
-- online / stale / offline
-- workerCount
-- activeTaskCount
-- lastHeartbeatAt
-- agents[]
-- version（如可提供）
-- runtimeMode 汇总（mock / openclaw-cli）
-
-### C. Agents / Workers 列表需要
-- workerId
-- nodeId
-- targetAgent
-- mode
-- status
-- currentTaskId
-- lastHeartbeatAt
-- online 状态
-- capabilities
-- lastResultSummary
-- lastError
-- recentTaskStatus
-
-### D. Tasks 面板需要
-- 活跃任务列表
-- 最近任务列表
-- 当前状态
-- claimedBy
-- timeoutSec
-- retryCount
-- deadLetterReason
-- executionMode
-- fallbackReason
-
-### E. Debug / Detail 视图需要
+需要数据：
+- 谁真的在工作
+- 谁只是排队待命
+- 谁卡住了
+- 谁离线了
+- 最近产出
+- 最近心跳
+- 当前任务
 - 最近错误
-- 最近结果摘要
-- artifactPath
-- remoteSessionKey
-- 最近完成时间
+
+在 bridge 语义里，对应就是：
+
+> **员工 = worker 代理的远端 agent 观测状态**
+
+## 4. 任务（Tasks）
+需要数据：
+- 当前任务
+- 卡住任务
+- 运行证据
+- 审批 / 执行链
+- 最近完成 / 最近失败 / dead-letter
+- retry / timeout / fallback
+
+这与 bridge `tasks` 表高度吻合。
+
+## 5. 设置（Settings）
+需要数据：
+- 接线状态
+- 安全风险摘要
+- 更新状态
+- 哪些数据已接好
+- 哪些数据源缺失但属正常降级
+
+bridge 本轮至少能提供：
+- control token 是否启用
+- worker token 是否启用
+- 是否已有活跃 worker
+- 是否已有心跳
+- 是否已有真实 CLI 执行证据
+- 是否存在 dead-letter / failed 任务
+- 是否配置了 control token
 
 ---
 
-## 五、建议新增接口清单
+## 三、核心定义：bridge 里“远端 agent 状态”怎么定义
 
-## 1. 总览接口
+当前项目能直接观察到的是：
 
-### `GET /control/summary`
+1. worker 心跳
+2. worker 当前状态
+3. worker 当前任务 / 最近任务
+4. 最近任务结果 / 错误 / fallback / dead-letter
+
+因此统一定义：
+
+> **远端 agent 状态 = bridge 侧观察到的 worker 代理状态 + 最近任务状态 + 心跳状态 + 最近执行证据**
+
+这套定义非常适合 `openclaw-control-center` 的：
+- 员工页
+- 总览页
+- 任务页
+- 设置页中的接线状态
+
+---
+
+## 四、建议接口：按 control-center 页面来设计
+
+## A. 总览页接口
+
+### `GET /control/overview`
 
 用途：
-- Control Center 首页 / 远端 bridge 看板
+- 给“总览”页直接使用
+- 比 `/control/summary` 更偏业务态势，而不是原始计数
 
 建议返回：
 
 ```json
 {
   "ok": true,
-  "bridge": {
-    "service": "openclaw-agent-bridge",
-    "nodeId": "openclaw-node-a",
-    "label": "Main OpenClaw Node",
-    "version": "2.0.0-alpha.1"
-  },
-  "counts": {
-    "nodes": 2,
-    "workers": 2,
+  "status": "healthy",
+  "summary": {
     "onlineWorkers": 2,
-    "staleWorkers": 0,
-    "offlineWorkers": 0,
-    "queuedTasks": 1,
-    "claimedTasks": 0,
-    "acceptedTasks": 0,
+    "busyWorkers": 1,
+    "idleWorkers": 1,
+    "queuedTasks": 0,
     "runningTasks": 1,
-    "activeTasks": 2,
-    "deadLetterTasks": 0
+    "deadLetterTasks": 0,
+    "recentFailures": 0
   },
-  "lastUpdatedAt": "2026-03-14T10:42:00Z"
-}
-```
-
----
-
-## 2. 节点列表
-
-### `GET /control/nodes`
-
-用途：
-- Control Center 远端节点列表
-
-建议返回：
-
-```json
-{
-  "count": 2,
-  "nodes": [
+  "risks": [
     {
-      "nodeId": "openclaw-node-a",
-      "label": "Main OpenClaw Node",
-      "online": true,
-      "health": "online",
-      "workerCount": 1,
-      "activeTaskCount": 0,
-      "agents": ["main"],
-      "modes": ["openclaw-cli"],
-      "lastHeartbeatAt": "2026-03-14T10:40:00Z",
-      "lastTaskAt": "2026-03-14T10:39:12Z"
-    }
-  ]
-}
-```
-
----
-
-## 3. 单节点详情
-
-### `GET /control/nodes/:nodeId`
-
-用途：
-- 点击节点后的详情面板
-
-建议返回：
-
-```json
-{
-  "nodeId": "openclaw-node-a",
-  "label": "Main OpenClaw Node",
-  "online": true,
-  "health": "online",
-  "workers": [
-    {
-      "workerId": "openclaw-node-a-worker",
-      "targetAgent": "main",
-      "mode": "openclaw-cli",
-      "status": "idle",
-      "currentTaskId": null,
-      "lastHeartbeatAt": "2026-03-14T10:40:00Z"
+      "level": "info",
+      "code": "control_token_enabled",
+      "message": "Control API token is enabled."
     }
   ],
-  "recentTasks": [],
-  "recentErrors": []
+  "attention": [
+    {
+      "type": "task",
+      "message": "1 task is currently running."
+    }
+  ],
+  "staff": [
+    {
+      "workerId": "openclaw-node-b-worker",
+      "nodeId": "openclaw-node-b",
+      "targetAgent": "main",
+      "status": "running",
+      "currentTaskId": "task_xxx"
+    }
+  ],
+  "updatedAt": "2026-03-14T12:00:00Z"
 }
 ```
 
 ---
 
-## 4. agent / worker 列表
+## B. 员工页接口
 
-### `GET /control/agents`
+### `GET /control/staff`
 
 用途：
-- Control Center 的远端 agent 状态面板
+- 对应 control-center 的“员工”页
 
 建议返回：
 
 ```json
 {
   "count": 2,
-  "agents": [
+  "staff": [
     {
       "workerId": "openclaw-node-b-worker",
       "nodeId": "openclaw-node-b",
       "targetAgent": "main",
       "displayName": "openclaw-node-b / main",
       "mode": "openclaw-cli",
-      "status": "idle",
       "online": true,
       "health": "online",
+      "status": "idle",
       "currentTaskId": null,
+      "nextStateHint": "waiting",
       "capabilities": ["research", "writing"],
-      "lastHeartbeatAt": "2026-03-14T10:41:00Z",
+      "lastHeartbeatAt": "2026-03-14T12:00:00Z",
       "lastTaskId": "task_xxx",
       "lastTaskStatus": "done",
       "lastResultSummary": "OpenClaw CLI executed task for agent main",
@@ -315,205 +234,238 @@ Control Center 不直接拼表，而是读取：
 }
 ```
 
----
-
-## 5. 单 agent / worker 状态
-
-### `GET /control/agents/:workerId`
-
-用途：
-- agent 详情页 / 侧边抽屉
-
-建议返回：
-- 基础 worker 信息
-- 当前任务
-- 最近任务列表
-- 最近错误
-- 最近结果摘要
+### 字段说明
+- `status`: worker 当前上报状态
+- `nextStateHint`: 给 UI 更人话的映射，例如：
+  - `running` → `working`
+  - `idle` + 无 queued 任务 → `waiting`
+  - `idle` + 有匹配 queued 任务 → `next-up`
+  - `offline` → `offline`
 
 ---
 
-## 6. 活跃任务面板
+## C. 任务页接口
 
-### `GET /control/tasks/active`
+### `GET /control/tasks/board`
 
 用途：
-- 当前运行 / 待接 / 已接受任务
+- 给“任务”页直接使用
+- 把 active / stalled / recent / dead-letter 打包在一起
 
 建议返回：
 
 ```json
 {
-  "count": 2,
-  "tasks": [
-    {
-      "id": "task_xxx",
-      "title": "Bridge 联调任务",
-      "status": "running",
-      "sourceNode": "openclaw-node-a",
-      "sourceAgent": "main",
-      "targetNode": "openclaw-node-b",
-      "targetAgent": "main",
-      "claimedBy": "openclaw-node-b-worker",
-      "claimedAt": "2026-03-14T10:20:00Z",
-      "acceptedAt": "2026-03-14T10:20:01Z",
-      "startedAt": "2026-03-14T10:20:02Z",
-      "timeoutSec": 300,
-      "retryCount": 0,
-      "executionMode": "openclaw-cli"
-    }
+  "active": [],
+  "stalled": [],
+  "recent": [],
+  "deadLetters": [],
+  "updatedAt": "2026-03-14T12:00:00Z"
+}
+```
+
+### `GET /control/tasks/active`
+
+用途：
+- 保留给轻量活跃任务看板
+
+### `GET /control/tasks/recent?limit=20`
+
+用途：
+- 最近完成 / 失败任务
+
+---
+
+## D. 设置页：接线状态
+
+### `GET /control/settings/wiring`
+
+用途：
+- 对应 control-center 的“接线状态”卡片
+
+建议返回：
+
+```json
+{
+  "ok": true,
+  "wiring": {
+    "bridgeHealth": "connected",
+    "controlToken": "configured",
+    "workerHeartbeat": "connected",
+    "workerRoster": "connected",
+    "realCliExecution": "connected",
+    "deadLetterWatcher": "connected",
+    "usageData": "not_provided_by_bridge",
+    "memoryDocs": "not_provided_by_bridge"
+  },
+  "notes": [
+    "This bridge provides execution and worker observability only.",
+    "Usage / subscription / memory / docs remain upstream control-center data sources."
   ]
 }
 ```
 
 ---
 
-## 7. 最近任务历史
+## E. 设置页：风险摘要
 
-### `GET /control/tasks/recent?limit=20`
+### `GET /control/settings/risk-summary`
 
 用途：
-- 最近完成 / 失败 / 死信任务列表
+- 对应 control-center 的“安全风险摘要” / 风险提示
 
-建议支持过滤：
-- `status`
-- `nodeId`
-- `targetAgent`
-- `limit`
+建议输出：
+- 是否仍使用 bridge 主 token 作为 control token
+- 是否存在离线 worker
+- 是否存在 dead-letter 累积
+- 是否最近有 failed 任务
+- 是否所有 worker 都是 mock 模式（若是，则提示“真实执行证据不足”）
 
 ---
 
-## 8. 最近错误列表
+## F. 最近错误接口
 
 ### `GET /control/errors/recent?limit=20`
 
 用途：
-- 控制中心错误面板 / 告警列表
-
-数据来源建议：
-- `tasks.error IS NOT NULL`
-- `tasks.status IN ('failed', 'dead_letter')`
-- worker 最近失败摘要（如后续补字段）
+- 让总览和任务页都能拿“最近异常”
 
 建议返回：
 - taskId
-- nodeId
-- workerId（如可推导）
+- targetNode
 - targetAgent
 - status
 - error
 - deadLetterReason
 - updatedAt
+- claimedBy
 
 ---
 
-## 六、在线状态判定规则
+## 五、保留并重命名现有第一批接口的语义
 
-建议统一规则：
+前面已经做出的接口，不废弃，但重新解释：
 
-### online
-- `now - lastHeartbeatAt <= 45s`
+### 已有接口 1：`GET /control/summary`
+现在应视为：
+- **底层总览统计接口**
+- 给 `/control/overview` 作为数据源之一
 
-### stale
-- `45s < now - lastHeartbeatAt <= 120s`
+### 已有接口 2：`GET /control/agents`
+现在应视为：
+- **员工页底层数据接口**
+- 后续可作为 `/control/staff` 的原始实现基础
 
-### offline
-- `now - lastHeartbeatAt > 120s`
+### 已有接口 3：`GET /control/tasks/active`
+现在应视为：
+- **任务页活跃任务子接口**
+- 后续由 `/control/tasks/board` 聚合调用或复用逻辑
 
-建议字段：
-- `online: boolean`
-- `health: "online" | "stale" | "offline"`
-
-这样 Control Center 可以直接映射状态颜色。
-
----
-
-## 七、建议补充的数据字段
-
-为了让第十三轮设计不只停在聚合层，建议顺手为后续版本预留这些字段：
-
-### workers 维度可补
-- `node_label`
-- `agent_label`
-- `version`
-- `last_error`
-- `last_result_summary`
-- `last_task_id`
-- `last_task_status`
-- `last_task_finished_at`
-
-### tasks 维度建议结构化输出
-当前很多字段已经在 result payload 里，但建议聚合接口中直接结构化吐出：
-- `executionMode`
-- `artifactPath`
-- `remoteSessionKey`
-- `fallbackReason`
+也就是说，前面做的不是白做，而是：
+> **要把它们从“OpenClaw 原生控制 UI 风格”重新包装成“control-center 页面风格”。**
 
 ---
 
-## 八、鉴权设计
+## 六、数据映射规则
 
-建议新增环境变量：
+## 员工页状态映射
 
-```bash
-BRIDGE_CONTROL_TOKEN=replace-me
-```
+建议：
 
-规则：
-- 若配置了 `BRIDGE_CONTROL_TOKEN`，则 `/control/*` 必须使用它
-- 若未配置，则回退到 `BRIDGE_TOKEN`
+### `working`
+满足：
+- worker.status = `busy`，或
+- currentTaskId 非空，或
+- 最近任务 status = `running`
 
-这样可以实现：
-- control-center 只读接入
-- 不直接暴露完整 bridge 管理 token
+### `waiting`
+满足：
+- worker.status = `idle`
+- 当前无任务
+- worker 在线
 
----
+### `next-up`
+满足：
+- worker.status = `idle`
+- 但存在匹配它 node/agent 的 queued task
 
-## 九、第十三轮分阶段实施建议
+### `offline`
+满足：
+- 心跳过期
 
-### Phase 1：最小可用（优先）
-先实现 3 个接口：
-1. `GET /control/summary`
-2. `GET /control/agents`
-3. `GET /control/tasks/active`
-
-这三个接口足够让 control-center 先做：
-- 远端总体状态卡片
-- 远端 agent 列表
-- 当前活跃任务面板
-
-### Phase 2：节点视图
-4. `GET /control/nodes`
-5. `GET /control/nodes/:nodeId`
-
-### Phase 3：历史 / 诊断
-6. `GET /control/tasks/recent`
-7. `GET /control/agents/:workerId`
-8. `GET /control/errors/recent`
+### `stalled`
+满足：
+- currentTaskId 非空
+- 且任务 running / accepted 超时过久
 
 ---
 
-## 十、验收标准
+## 七、bridge 当前不能提供的内容
 
-第十三轮完成，至少满足：
+为了避免误导 control-center，文档必须明确：
 
-- control-center 能调用一个 summary 接口拿到远端总览
-- 能看到远端 worker / agent 在线状态
-- 能看到活跃任务
-- 能区分 online / stale / offline
-- 能看最近错误和最近执行结果
-- 鉴权独立、可控
+bridge 当前**不能直接提供**：
+- OpenClaw token / cost / subscription 真正消费数据
+- 记忆文件内容
+- 文档工作台源文件
+- approval mutation 细节
+- provider 账单快照
+
+因此 control-center 若显示这些页：
+- 应走自己已有数据源
+- 或把 bridge 标记为“部分接线，不提供该数据”
 
 ---
 
-## 十一、最终建议
+## 八、建议实施顺序（修正版）
 
-当前项目里不要急着声称“拿到了 OpenClaw agent 内核态”。
+### Phase 1：页面对齐
+优先新增：
+1. `GET /control/overview`
+2. `GET /control/staff`
+3. `GET /control/tasks/board`
+4. `GET /control/settings/wiring`
 
-更准确、更好落地的说法是：
+### Phase 2：诊断增强
+5. `GET /control/tasks/recent`
+6. `GET /control/errors/recent`
+7. `GET /control/settings/risk-summary`
 
-> 第十三轮新增的是 **bridge-observed remote agent status API**。
->
-> 也就是：通过 bridge 观察到的远端 agent / worker / task 运行状态接口。
+### Phase 3：节点补充（如果 control-center 后续要）
+8. `GET /control/nodes`
+9. `GET /control/nodes/:nodeId`
 
-这套定义足够支撑 control-center 接入，而且和当前项目架构完全匹配。
+注意：
+对这个项目而言，**nodes 不是第一优先级**，
+因为它的页面语言更偏“员工 / 任务 / 总览 / 设置”，不是纯 infra 面板。
+
+---
+
+## 九、验收标准
+
+第十三轮按 control-center 语义完成，至少满足：
+
+- `总览` 页能看到远端 bridge 的整体状态
+- `员工` 页能区分谁在工作、谁待命、谁离线、谁卡住
+- `任务` 页能看到活跃任务、最近任务和运行证据
+- `设置` 页能看到接线状态和风险摘要
+- 不伪造 bridge 无法掌握的数据
+- 接口字段是 UI 友好的，不强迫前端自己还原业务语义
+
+---
+
+## 十、最终结论
+
+第十三轮不该再按“通用 nodes/agents/task API”来理解，
+而应该明确成：
+
+> **为 TianyiDataScience/openclaw-control-center 提供远端执行观测 API。**
+
+也就是：
+- 总览接口
+- 员工接口
+- 任务接口
+- 设置接线接口
+- 风险摘要接口
+
+这才和目标控制面板真正对齐。
