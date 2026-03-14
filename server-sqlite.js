@@ -9,9 +9,12 @@ const { DatabaseSync } = require('node:sqlite');
 const PORT = Number(process.env.BRIDGE_PORT || 8787);
 const TOKEN = process.env.BRIDGE_TOKEN || 'change-me';
 const WORKER_TOKEN = process.env.BRIDGE_WORKER_TOKEN || '';
+const CONTROL_TOKEN = process.env.BRIDGE_CONTROL_TOKEN || TOKEN;
 const DATA_DIR = process.env.BRIDGE_DATA_DIR || path.join(__dirname, 'data');
 const DB_FILE = process.env.BRIDGE_DB_FILE || path.join(DATA_DIR, 'bridge.sqlite');
 const DEFAULT_TASK_TIMEOUT_SEC = Number(process.env.BRIDGE_DEFAULT_TASK_TIMEOUT_SEC || 600);
+const NODE_ID = process.env.BRIDGE_NODE_ID || 'openclaw-node';
+const NODE_LABEL = process.env.BRIDGE_NODE_LABEL || NODE_ID;
 
 fs.mkdirSync(DATA_DIR, { recursive: true });
 const db = new DatabaseSync(DB_FILE);
@@ -134,6 +137,15 @@ function getAuthToken(req) {
 function requireBridgeAuth(req, res) {
   const token = getAuthToken(req);
   if (!TOKEN || token !== TOKEN) {
+    unauthorized(res);
+    return false;
+  }
+  return true;
+}
+
+function requireControlAuth(req, res) {
+  const token = getAuthToken(req);
+  if (!CONTROL_TOKEN || token !== CONTROL_TOKEN) {
     unauthorized(res);
     return false;
   }
@@ -317,6 +329,114 @@ function reapTimedOutTasks() {
   return processed;
 }
 
+
+function parseTs(value) {
+  const ms = Date.parse(value || '');
+  return Number.isNaN(ms) ? null : ms;
+}
+
+function resolveWorkerHealth(lastHeartbeatAt) {
+  const ts = parseTs(lastHeartbeatAt);
+  if (!ts) return { online: false, health: 'offline' };
+  const ageSec = (Date.now() - ts) / 1000;
+  if (ageSec <= 45) return { online: true, health: 'online' };
+  if (ageSec <= 120) return { online: false, health: 'stale' };
+  return { online: false, health: 'offline' };
+}
+
+function getLatestTaskForWorker(worker) {
+  return db.prepare(`
+    SELECT * FROM tasks
+    WHERE claimed_by = ? OR (target_node = ? AND target_agent = ?)
+    ORDER BY updated_at DESC
+    LIMIT 1
+  `).get(worker.workerId, worker.nodeId || null, worker.targetAgent || null);
+}
+
+function rowToControlAgent(row) {
+  const worker = rowToWorker(row);
+  if (!worker) return null;
+  const latestTaskRow = getLatestTaskForWorker(worker);
+  const latestTask = rowToTask(latestTaskRow);
+  const healthInfo = resolveWorkerHealth(worker.lastHeartbeatAt);
+  return {
+    workerId: worker.workerId,
+    nodeId: worker.nodeId,
+    targetAgent: worker.targetAgent,
+    displayName: `${worker.nodeId || 'unknown-node'} / ${worker.targetAgent || 'unknown-agent'}`,
+    mode: worker.mode,
+    status: worker.status,
+    online: healthInfo.online,
+    health: healthInfo.health,
+    currentTaskId: worker.currentTaskId,
+    capabilities: worker.capabilities,
+    metadata: worker.metadata,
+    lastHeartbeatAt: worker.lastHeartbeatAt,
+    lastTaskId: latestTask?.id || null,
+    lastTaskStatus: latestTask?.status || null,
+    lastResultSummary: latestTask?.resultSummary || null,
+    lastError: latestTask?.error || null,
+    updatedAt: worker.updatedAt,
+  };
+}
+
+function getControlSummary() {
+  const workerRows = db.prepare(`SELECT * FROM workers ORDER BY updated_at DESC`).all();
+  const tasksByStatusRows = db.prepare(`SELECT status, COUNT(*) AS c FROM tasks GROUP BY status`).all();
+  const countsByStatus = Object.fromEntries(tasksByStatusRows.map(r => [r.status, r.c]));
+  const workers = workerRows.map(rowToControlAgent).filter(Boolean);
+  const onlineWorkers = workers.filter(w => w.health === 'online').length;
+  const staleWorkers = workers.filter(w => w.health === 'stale').length;
+  const offlineWorkers = workers.filter(w => w.health === 'offline').length;
+  return {
+    ok: true,
+    bridge: {
+      service: 'openclaw-agent-bridge',
+      nodeId: NODE_ID,
+      label: NODE_LABEL,
+      version: '2.0.0-alpha.1',
+      db: DB_FILE,
+    },
+    counts: {
+      nodes: new Set(workerRows.map(r => r.node_id).filter(Boolean)).size,
+      workers: workerRows.length,
+      onlineWorkers,
+      staleWorkers,
+      offlineWorkers,
+      queuedTasks: countsByStatus.queued || 0,
+      claimedTasks: countsByStatus.claimed || 0,
+      acceptedTasks: countsByStatus.accepted || 0,
+      runningTasks: countsByStatus.running || 0,
+      activeTasks: (countsByStatus.queued || 0) + (countsByStatus.claimed || 0) + (countsByStatus.accepted || 0) + (countsByStatus.running || 0),
+      deadLetterTasks: countsByStatus.dead_letter || 0,
+    },
+    lastUpdatedAt: now(),
+  };
+}
+
+function getControlAgents() {
+  const rows = db.prepare(`SELECT * FROM workers ORDER BY updated_at DESC`).all();
+  const agents = rows.map(rowToControlAgent).filter(Boolean);
+  return { count: agents.length, agents };
+}
+
+function getControlActiveTasks(limit = 100) {
+  const rows = db.prepare(`
+    SELECT * FROM tasks
+    WHERE status IN ('queued', 'claimed', 'accepted', 'running')
+    ORDER BY updated_at DESC
+    LIMIT ?
+  `).all(limit);
+  const tasks = rows.map(rowToTask).map(task => ({
+    ...task,
+    executionMode: parseJsonOrDefault(task.result, {})?.executionMode || null,
+    artifactPath: parseJsonOrDefault(task.result, {})?.artifactPath || null,
+    remoteSessionKey: parseJsonOrDefault(task.result, {})?.remoteSessionKey || null,
+    fallbackReason: parseJsonOrDefault(task.result, {})?.fallbackReason || null,
+  }));
+  return { count: tasks.length, tasks };
+}
+
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
   const pathname = url.pathname;
@@ -380,6 +500,22 @@ const server = http.createServer(async (req, res) => {
     if (!requireBridgeAuth(req, res)) return;
     const processed = reapTimedOutTasks();
     return json(res, 200, { ok: true, processedCount: processed.length, processed });
+  }
+
+  if (req.method === 'GET' && pathname === '/control/summary') {
+    if (!requireControlAuth(req, res)) return;
+    return json(res, 200, getControlSummary());
+  }
+
+  if (req.method === 'GET' && pathname === '/control/agents') {
+    if (!requireControlAuth(req, res)) return;
+    return json(res, 200, getControlAgents());
+  }
+
+  if (req.method === 'GET' && pathname === '/control/tasks/active') {
+    if (!requireControlAuth(req, res)) return;
+    const limit = Number(url.searchParams.get('limit') || 100);
+    return json(res, 200, getControlActiveTasks(limit));
   }
 
   const isWorkerRoute = /\/claim$|\/status$|\/result$|\/retry$/.test(pathname);
