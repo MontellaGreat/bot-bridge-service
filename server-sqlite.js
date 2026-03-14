@@ -533,6 +533,90 @@ function getControlWiring() {
   };
 }
 
+function getControlRiskSummary() {
+  const summary = getControlSummary();
+  const agents = getControlAgents().agents;
+  const errors = getRecentErrors(20);
+  const risks = [];
+
+  if (CONTROL_TOKEN === TOKEN) {
+    risks.push({
+      level: 'warn',
+      code: 'control_uses_bridge_token',
+      title: '控制面与主桥接共用 token',
+      message: '当前 /control/* 沿用 BRIDGE_TOKEN，建议单独配置 BRIDGE_CONTROL_TOKEN。',
+      impact: '控制面鉴权隔离不足。',
+      suggestion: '新增并启用 BRIDGE_CONTROL_TOKEN。',
+    });
+  }
+
+  const offlineAgents = agents.filter(a => a.health === 'offline');
+  if (offlineAgents.length > 0) {
+    risks.push({
+      level: 'warn',
+      code: 'offline_workers',
+      title: '存在离线 worker',
+      message: `${offlineAgents.length} 个 worker 超过心跳窗口未更新。`,
+      impact: '控制中心会看到员工离线，任务可能无人接单。',
+      suggestion: '检查 worker 进程、bridge 地址和 systemd 状态。',
+    });
+  }
+
+  const staleAgents = agents.filter(a => a.health === 'stale');
+  if (staleAgents.length > 0) {
+    risks.push({
+      level: 'warn',
+      code: 'stale_workers',
+      title: '存在心跳变陈旧的 worker',
+      message: `${staleAgents.length} 个 worker 处于 stale 状态。`,
+      impact: '控制中心会显示状态不稳定，可能即将离线。',
+      suggestion: '检查网络抖动或 worker 负载。',
+    });
+  }
+
+  if ((summary.counts.deadLetterTasks || 0) > 0) {
+    risks.push({
+      level: 'warn',
+      code: 'dead_letter_present',
+      title: '存在 dead-letter 任务',
+      message: `当前共有 ${summary.counts.deadLetterTasks} 条 dead-letter 任务。`,
+      impact: '说明部分任务已经失败并退出主流程。',
+      suggestion: '查看 /control/errors/recent 与 /control/tasks/board 排查原因。',
+    });
+  }
+
+  if (errors.length > 0) {
+    risks.push({
+      level: 'warn',
+      code: 'recent_errors_present',
+      title: '近期存在错误任务',
+      message: `最近错误/异常任务 ${errors.length} 条。`,
+      impact: '总览与任务页会出现异常提示。',
+      suggestion: '优先查看最近 dead-letter / failed 任务。',
+    });
+  }
+
+  const allMock = agents.length > 0 && agents.every(a => a.mode === 'mock');
+  if (allMock) {
+    risks.push({
+      level: 'info',
+      code: 'only_mock_workers',
+      title: '当前仅检测到 mock worker',
+      message: '所有 worker 当前都在 mock 模式下运行。',
+      impact: '控制中心可看到链路，但真实 CLI 执行证据不足。',
+      suggestion: '若需要真实执行观测，请启用 openclaw-cli 模式 worker。',
+    });
+  }
+
+  return {
+    ok: true,
+    status: risks.some(r => r.level === 'warn') ? 'attention' : 'healthy',
+    count: risks.length,
+    risks,
+    updatedAt: now(),
+  };
+}
+
 function getControlTasksRecent(limit = 20) {
   const rows = db.prepare(`
     SELECT * FROM tasks
@@ -676,6 +760,11 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'GET' && pathname === '/control/settings/wiring') {
     if (!requireControlAuth(req, res)) return;
     return json(res, 200, getControlWiring());
+  }
+
+  if (req.method === 'GET' && pathname === '/control/settings/risk-summary') {
+    if (!requireControlAuth(req, res)) return;
+    return json(res, 200, getControlRiskSummary());
   }
 
   if (req.method === 'GET' && pathname === '/control/tasks/board') {
