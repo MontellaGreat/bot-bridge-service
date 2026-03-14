@@ -617,6 +617,62 @@ function getControlRiskSummary() {
   };
 }
 
+function getNodeWorkers(nodeId) {
+  return db.prepare(`SELECT * FROM workers WHERE node_id = ? ORDER BY updated_at DESC`).all(nodeId);
+}
+
+function getNodeRecentTasks(nodeId, limit = 10) {
+  return db.prepare(`
+    SELECT * FROM tasks
+    WHERE source_node = ? OR target_node = ?
+    ORDER BY updated_at DESC
+    LIMIT ?
+  `).all(nodeId, nodeId, limit).map(rowToTask);
+}
+
+function summarizeNode(nodeId) {
+  const workerRows = getNodeWorkers(nodeId);
+  const workers = workerRows.map(rowToControlAgent).filter(Boolean);
+  const healths = workers.map(w => w.health);
+  const online = healths.includes('online');
+  const health = online ? 'online' : (healths.includes('stale') ? 'stale' : 'offline');
+  const activeTaskCount = db.prepare(`SELECT COUNT(*) AS c FROM tasks WHERE status IN ('queued', 'claimed', 'accepted', 'running') AND target_node = ?`).get(nodeId).c;
+  const lastHeartbeatAt = workers.map(w => w.lastHeartbeatAt).filter(Boolean).sort().reverse()[0] || null;
+  const recentTasks = getNodeRecentTasks(nodeId, 1);
+  const lastTaskAt = recentTasks[0]?.updatedAt || null;
+  return {
+    nodeId,
+    label: nodeId === NODE_ID ? NODE_LABEL : nodeId,
+    online: health === 'online',
+    health,
+    workerCount: workers.length,
+    activeTaskCount,
+    agents: [...new Set(workers.map(w => w.targetAgent).filter(Boolean))],
+    modes: [...new Set(workers.map(w => w.mode).filter(Boolean))],
+    lastHeartbeatAt,
+    lastTaskAt,
+  };
+}
+
+function getControlNodes() {
+  const nodeIds = [...new Set(db.prepare(`SELECT node_id FROM workers WHERE node_id IS NOT NULL`).all().map(r => r.node_id))];
+  const nodes = nodeIds.map(summarizeNode);
+  return { count: nodes.length, nodes };
+}
+
+function getControlNodeDetail(nodeId) {
+  const workers = getNodeWorkers(nodeId).map(rowToControlAgent).filter(Boolean);
+  const recentTasks = getNodeRecentTasks(nodeId, 10);
+  const recentErrors = getRecentErrors(50).filter(e => e.targetNode === nodeId).slice(0, 10);
+  const summary = summarizeNode(nodeId);
+  return {
+    ...summary,
+    workers,
+    recentTasks,
+    recentErrors,
+  };
+}
+
 function getControlTasksRecent(limit = 20) {
   const rows = db.prepare(`
     SELECT * FROM tasks
@@ -783,6 +839,17 @@ const server = http.createServer(async (req, res) => {
     if (!requireControlAuth(req, res)) return;
     const limit = Number(url.searchParams.get('limit') || 20);
     return json(res, 200, getControlErrorsRecent(limit));
+  }
+
+  if (req.method === 'GET' && pathname === '/control/nodes') {
+    if (!requireControlAuth(req, res)) return;
+    return json(res, 200, getControlNodes());
+  }
+
+  const controlNodeMatch = pathname.match(/^\/control\/nodes\/([^/]+)$/);
+  if (req.method === 'GET' && controlNodeMatch) {
+    if (!requireControlAuth(req, res)) return;
+    return json(res, 200, getControlNodeDetail(controlNodeMatch[1]));
   }
 
   const isWorkerRoute = /\/claim$|\/status$|\/result$|\/retry$/.test(pathname);
