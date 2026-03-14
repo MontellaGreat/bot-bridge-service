@@ -1,12 +1,14 @@
 # TESTING.md
 
-# 第六轮测试办法（heartbeat / roster / timeout watcher）
+# OpenClaw Agent Bridge 测试与验收手册
 
-目标：验证 bridge 是否已经具备：
-1. worker heartbeat 上报
-2. worker roster 查询
-3. task timeout watcher / 超时回收
-4. 与此前能力匹配 / retry / mock fallback 能协同工作
+目标：统一 bridge / worker 的验证方式，覆盖：
+1. health / 鉴权
+2. worker heartbeat / roster
+3. 任务闭环
+4. 真实 `openclaw-cli` 执行
+5. timeout watcher / retry / dead-letter
+6. systemd 托管验活
 
 ---
 
@@ -20,7 +22,7 @@ BRIDGE_WORKER_TOKEN=worker-secret
 BRIDGE_DEFAULT_TASK_TIMEOUT_SEC=600
 ```
 
-### worker 启动示例
+### Worker 启动示例（真实 CLI）
 ```bash
 source .env
 BRIDGE_URL=http://127.0.0.1:${BRIDGE_PORT} \
@@ -29,15 +31,53 @@ BRIDGE_NODE_ID=openclaw-node-b \
 BRIDGE_TARGET_AGENT=main \
 BRIDGE_WORKER_CAPABILITIES=research,writing,vision,engineering,testing,multimedia \
 BRIDGE_WORKER_MODE=openclaw-cli \
-BRIDGE_FALLBACK_TO_MOCK=true \
+BRIDGE_FALLBACK_TO_MOCK=false \
 BRIDGE_HEARTBEAT_INTERVAL_MS=15000 \
 OPENCLAW_RUN_TIMEOUT_MS=30000 \
 node worker-openclaw.js
 ```
 
+### Worker 启动示例（mock）
+```bash
+source .env
+BRIDGE_URL=http://127.0.0.1:${BRIDGE_PORT} \
+BRIDGE_NODE_ID=openclaw-node-b \
+BRIDGE_TARGET_AGENT=main \
+BRIDGE_WORKER_MODE=mock \
+node worker-openclaw.js
+```
+
 ---
 
-## 二、heartbeat / roster 测试
+## 二、health / 鉴权测试
+
+### health
+```bash
+curl http://127.0.0.1:${BRIDGE_PORT}/health
+```
+
+### workers（需 token）
+```bash
+curl http://127.0.0.1:${BRIDGE_PORT}/workers \
+  -H "Authorization: Bearer ${BRIDGE_TOKEN}"
+```
+
+### reap-timeouts（需 token）
+```bash
+curl -X POST http://127.0.0.1:${BRIDGE_PORT}/maintenance/reap-timeouts \
+  -H "Authorization: Bearer ${BRIDGE_TOKEN}" \
+  -H 'Content-Type: application/json' \
+  -d '{}'
+```
+
+### 预期
+- `/health` 返回 `ok: true`
+- `/workers` 返回 200
+- `/maintenance/reap-timeouts` 返回 200
+
+---
+
+## 三、heartbeat / roster 测试
 
 ### 查询所有 worker
 ```bash
@@ -55,11 +95,13 @@ curl http://127.0.0.1:${BRIDGE_PORT}/workers \
 - `status`
 - `lastHeartbeatAt`
 
+心跳时间应持续刷新。
+
 ---
 
-## 三、降级闭环测试
+## 四、任务闭环测试
 
-发一个允许 fallback 的任务：
+发一个标准任务：
 ```bash
 curl -X POST http://127.0.0.1:${BRIDGE_PORT}/tasks \
   -H "Authorization: Bearer ${BRIDGE_TOKEN}" \
@@ -70,23 +112,51 @@ curl -X POST http://127.0.0.1:${BRIDGE_PORT}/tasks \
     "target_node":"openclaw-node-b",
     "target_agent":"main",
     "type":"delegated_work",
-    "title":"第六轮降级测试",
-    "content":"请返回一句：第六轮降级测试已收到。",
-    "requiredCapabilities":["writing"],
-    "maxRetries":1,
-    "timeoutSec":120,
-    "metadata":{"allowMockFallback":true}
+    "title":"闭环测试",
+    "content":"请返回一句：任务已收到。",
+    "maxRetries":0,
+    "timeoutSec":120
   }'
 ```
 
+查询任务：
+```bash
+curl http://127.0.0.1:${BRIDGE_PORT}/tasks/task_xxx \
+  -H "Authorization: Bearer ${BRIDGE_TOKEN}"
+```
+
 ### 预期
-- worker heartbeat 先显示 `idle`
-- 接单后显示 `busy`
-- 完成后回到 `idle`
+状态完整流转：
+```text
+queued -> claimed -> accepted -> running -> done
+```
 
 ---
 
-## 四、timeout watcher 测试
+## 五、真实 OpenClaw CLI 模式测试
+
+### 先做 CLI 直连自测
+```bash
+openclaw agent --agent main --message "test"
+```
+
+### 预期
+- 返回码 0
+- stdout 有正常输出
+- stderr 为空或无致命错误
+
+### 再做 bridge 真实任务测试
+worker 使用：
+- `BRIDGE_WORKER_MODE=openclaw-cli`
+- `BRIDGE_FALLBACK_TO_MOCK=false`
+
+然后下发任务，确认：
+- 不是 mock 执行
+- `resultSummary` 显示 `OpenClaw CLI executed task for agent ...`
+
+---
+
+## 六、timeout watcher 测试
 
 发一个超短超时任务：
 ```bash
@@ -101,47 +171,57 @@ curl -X POST http://127.0.0.1:${BRIDGE_PORT}/tasks \
     "type":"delegated_work",
     "title":"超时回收测试",
     "content":"这是一个用于超时回收测试的任务。",
-    "requiredCapabilities":["writing"],
     "maxRetries":1,
     "timeoutSec":1
   }'
 ```
 
-等待超时后，手动执行：
+等待超时后执行：
 ```bash
 curl -X POST http://127.0.0.1:${BRIDGE_PORT}/maintenance/reap-timeouts \
-  -H "Authorization: Bearer ${BRIDGE_TOKEN}"
+  -H "Authorization: Bearer ${BRIDGE_TOKEN}" \
+  -H 'Content-Type: application/json' \
+  -d '{}'
 ```
 
 ### 预期
-- 若任务仍活跃且已超时：
-  - 有 retry 配额则 `requeued`
-  - 超过配额则 `dead_letter`
-
----
-
-## 五、结果检查
-
-查询单个任务：
-```bash
-curl http://127.0.0.1:${BRIDGE_PORT}/tasks/task_xxx \
-  -H "Authorization: Bearer ${BRIDGE_TOKEN}"
-```
+- 第一次超时：`requeued`
+- 超过配额后：`dead_letter`
 
 重点看：
 - `timeoutSec`
 - `timedOutAt`
 - `retryCount`
 - `deadLetterReason`
-- `claimedBy`
 - `status`
+- `finishedAt`
+- `error`
 
 ---
 
-## 六、结论标准
+## 七、systemd 托管验活
 
-第六轮验证成功，至少意味着：
-- worker heartbeat 生效
+```bash
+systemctl status bot-bridge.service --no-pager
+systemctl status bot-bridge-worker.service --no-pager
+systemctl is-enabled bot-bridge.service
+systemctl is-enabled bot-bridge-worker.service
+```
+
+### 预期
+- 两个服务均为 `active (running)`
+- 两个服务均已 `enabled`
+
+---
+
+## 八、结论标准
+
+若以下全部满足，则可判定项目通过验收：
+- bridge health 正常
 - `/workers` roster 可查询
-- timeout watcher 能识别并回收卡死任务
-- 与 fallback / retry 机制可协同工作
+- heartbeat 持续刷新
+- 任务可完整闭环
+- 真实 `openclaw-cli` 模式成功
+- timeout watcher 可回收超时任务
+- retry / dead-letter 生效
+- Bridge / Worker 已 systemd 托管并开机自启
