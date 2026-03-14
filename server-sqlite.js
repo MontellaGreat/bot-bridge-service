@@ -533,6 +533,55 @@ function getControlWiring() {
   };
 }
 
+function getControlTasksRecent(limit = 20) {
+  const rows = db.prepare(`
+    SELECT * FROM tasks
+    ORDER BY updated_at DESC
+    LIMIT ?
+  `).all(limit);
+  const tasks = rows.map(rowToTask).map(task => ({
+    ...task,
+    executionMode: parseJsonOrDefault(task.result, {})?.executionMode || null,
+    artifactPath: parseJsonOrDefault(task.result, {})?.artifactPath || null,
+    remoteSessionKey: parseJsonOrDefault(task.result, {})?.remoteSessionKey || null,
+    fallbackReason: parseJsonOrDefault(task.result, {})?.fallbackReason || null,
+  }));
+  return { count: tasks.length, tasks };
+}
+
+function getControlErrorsRecent(limit = 20) {
+  const errors = getRecentErrors(limit);
+  return { count: errors.length, errors };
+}
+
+function getControlTasksBoard(limit = 20) {
+  const active = getControlActiveTasks(limit).tasks;
+  const recent = getControlTasksRecent(limit).tasks.filter(t => ['done', 'failed', 'dead_letter'].includes(t.status));
+  const deadLetters = recent.filter(t => t.status === 'dead_letter');
+  const stalled = db.prepare(`
+    SELECT * FROM tasks
+    WHERE status IN ('claimed', 'accepted', 'running')
+    ORDER BY updated_at DESC
+    LIMIT ?
+  `).all(limit).map(rowToTask).filter(task => {
+    const anchor = getTaskActiveAnchor(task);
+    if (!anchor) return false;
+    const ms = Date.now() - Date.parse(anchor);
+    const timeoutMs = Number(task.timeoutSec || DEFAULT_TASK_TIMEOUT_SEC || 0) * 1000;
+    return timeoutMs > 0 && ms > timeoutMs;
+  }).map(task => ({
+    ...task,
+    stalledMs: Date.now() - Date.parse(getTaskActiveAnchor(task)),
+  }));
+  return {
+    active,
+    stalled,
+    recent,
+    deadLetters,
+    updatedAt: now(),
+  };
+}
+
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
   const pathname = url.pathname;
@@ -627,6 +676,24 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'GET' && pathname === '/control/settings/wiring') {
     if (!requireControlAuth(req, res)) return;
     return json(res, 200, getControlWiring());
+  }
+
+  if (req.method === 'GET' && pathname === '/control/tasks/board') {
+    if (!requireControlAuth(req, res)) return;
+    const limit = Number(url.searchParams.get('limit') || 20);
+    return json(res, 200, getControlTasksBoard(limit));
+  }
+
+  if (req.method === 'GET' && pathname === '/control/tasks/recent') {
+    if (!requireControlAuth(req, res)) return;
+    const limit = Number(url.searchParams.get('limit') || 20);
+    return json(res, 200, getControlTasksRecent(limit));
+  }
+
+  if (req.method === 'GET' && pathname === '/control/errors/recent') {
+    if (!requireControlAuth(req, res)) return;
+    const limit = Number(url.searchParams.get('limit') || 20);
+    return json(res, 200, getControlErrorsRecent(limit));
   }
 
   const isWorkerRoute = /\/claim$|\/status$|\/result$|\/retry$/.test(pathname);
