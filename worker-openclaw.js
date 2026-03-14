@@ -188,8 +188,8 @@ async function executeViaOpenClawCli(task) {
   const targetAgent = task.targetAgent || task.target || TARGET_AGENT;
   const prompt = task.content || task.title || 'No content provided';
   const candidates = [
-    ['run', '--agent', targetAgent, prompt],
     ['agent', '--agent', targetAgent, '--message', prompt],
+    ['agent', '--agent', targetAgent, prompt],
   ];
 
   let lastError = null;
