@@ -1,0 +1,73 @@
+From 76e103085b4330bfbf4cf427820f7f48db499d4d Mon Sep 17 00:00:00 2001
+From: Moying <moying@local.invalid>
+Date: Sat, 14 Mar 2026 18:41:17 +0800
+Subject: [PATCH] chore: add startup scripts and systemd unit
+
+---
+ run-control-center.sh                   |  9 +++++++++
+ start-control-center.sh                 | 12 ++++++++++++
+ systemd/openclaw-control-center.service | 17 +++++++++++++++++
+ 3 files changed, 38 insertions(+)
+ create mode 100755 run-control-center.sh
+ create mode 100755 start-control-center.sh
+ create mode 100644 systemd/openclaw-control-center.service
+
+diff --git a/run-control-center.sh b/run-control-center.sh
+new file mode 100755
+index 0000000..80cdc06
+--- /dev/null
++++ b/run-control-center.sh
+@@ -0,0 +1,9 @@
++#!/usr/bin/env bash
++set -euo pipefail
++cd /home/admin/.openclaw/workspace/openclaw-control-center
++set -a
++. ./.env
++set +a
++export UI_MODE=true
++export UI_PORT="${UI_PORT:-4310}"
++exec /usr/bin/node --import tsx /home/admin/.openclaw/workspace/openclaw-control-center/src/index.ts
+diff --git a/start-control-center.sh b/start-control-center.sh
+new file mode 100755
+index 0000000..be3f81d
+--- /dev/null
++++ b/start-control-center.sh
+@@ -0,0 +1,12 @@
++#!/usr/bin/env bash
++set -euo pipefail
++cd /home/admin/.openclaw/workspace/openclaw-control-center
++set -a
++. ./.env
++set +a
++export UI_MODE=true
++export UI_PORT="${UI_PORT:-4310}"
++mkdir -p runtime
++: > runtime/control-center.out.log
++: > runtime/control-center.err.log
++setsid -f /usr/bin/nohup node --import tsx src/index.ts >> runtime/control-center.out.log 2>> runtime/control-center.err.log < /dev/null
+diff --git a/systemd/openclaw-control-center.service b/systemd/openclaw-control-center.service
+new file mode 100644
+index 0000000..8dd1d22
+--- /dev/null
++++ b/systemd/openclaw-control-center.service
+@@ -0,0 +1,17 @@
++[Unit]
++Description=OpenClaw Control Center
++After=network.target
++
++[Service]
++Type=simple
++User=admin
++WorkingDirectory=/home/admin/.openclaw/workspace/openclaw-control-center
++EnvironmentFile=/home/admin/.openclaw/workspace/openclaw-control-center/.env
++Environment=UI_MODE=true
++Environment=UI_PORT=4310
++ExecStart=/home/admin/.openclaw/workspace/openclaw-control-center/run-control-center.sh
++Restart=always
++RestartSec=5
++
++[Install]
++WantedBy=multi-user.target
+-- 
+2.43.7
+

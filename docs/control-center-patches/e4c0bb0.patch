@@ -1,0 +1,264 @@
+From e4c0bb011868bee47a69bfeb4aedcc057877fef7 Mon Sep 17 00:00:00 2001
+From: Moying <moying@local.invalid>
+Date: Sat, 14 Mar 2026 13:55:29 +0800
+Subject: [PATCH] feat: add bridge control adapter proxy routes
+
+---
+ .env.example                  |  3 ++
+ package-lock.json             |  5 +-
+ src/config.ts                 |  2 +
+ src/index.ts                  |  8 +--
+ src/runtime/bridge-control.ts | 91 +++++++++++++++++++++++++++++++++++
+ src/ui/server.ts              | 60 +++++++++++++++++++++++
+ 6 files changed, 163 insertions(+), 6 deletions(-)
+ create mode 100644 src/runtime/bridge-control.ts
+
+diff --git a/.env.example b/.env.example
+index fb63936..0d31267 100644
+--- a/.env.example
++++ b/.env.example
+@@ -1,6 +1,9 @@
+ # Mission Control MVP flags
+ # Keep readonly true until explicit live-mode validation is complete.
+ GATEWAY_URL=ws://127.0.0.1:18789
++# Optional bridge observability source for remote execution panels.
++# BRIDGE_CONTROL_BASE_URL=http://127.0.0.1:8787
++# BRIDGE_CONTROL_TOKEN=replace-me
+ # Optional path overrides when your OpenClaw/Codex data is not in the default home locations.
+ # OPENCLAW_HOME=/path/to/.openclaw
+ # CODEX_HOME=/path/to/.codex
+diff --git a/package-lock.json b/package-lock.json
+index 5fd8763..e456267 100644
+--- a/package-lock.json
++++ b/package-lock.json
+@@ -1,12 +1,13 @@
+ {
+   "name": "openclaw-control-center",
+-  "version": "0.1.0",
++  "version": "0.1.1",
+   "lockfileVersion": 3,
+   "requires": true,
+   "packages": {
+     "": {
+       "name": "openclaw-control-center",
+-      "version": "0.1.0",
++      "version": "0.1.1",
++      "license": "MIT",
+       "devDependencies": {
+         "@types/node": "^22.13.10",
+         "tsx": "^4.20.0",
+diff --git a/src/config.ts b/src/config.ts
+index 480d42a..e08ed56 100644
+--- a/src/config.ts
++++ b/src/config.ts
+@@ -1,4 +1,6 @@
+ export const GATEWAY_URL = readStringEnv(process.env.GATEWAY_URL, "ws://127.0.0.1:18789");
++export const BRIDGE_CONTROL_BASE_URL = readStringEnv(process.env.BRIDGE_CONTROL_BASE_URL, "");
++export const BRIDGE_CONTROL_TOKEN = readStringEnv(process.env.BRIDGE_CONTROL_TOKEN, "");
+ 
+ export const READONLY_MODE = process.env.READONLY_MODE !== "false";
+ export const APPROVAL_ACTIONS_ENABLED = process.env.APPROVAL_ACTIONS_ENABLED === "true";
+diff --git a/src/index.ts b/src/index.ts
+index b84832b..bbd422f 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -59,6 +59,10 @@ async function start(): Promise<void> {
+     return;
+   }
+ 
++  if (UI_MODE) {
++    startUiServer(UI_PORT, client);
++  }
++
+   await runMonitorOnce(adapter);
+ 
+   if (CONTINUOUS_MODE) {
+@@ -67,10 +71,6 @@ async function start(): Promise<void> {
+       void runMonitorOnce(adapter);
+     }, intervalMs);
+   }
+-
+-  if (UI_MODE) {
+-    startUiServer(UI_PORT, client);
+-  }
+ }
+ 
+ void start();
+diff --git a/src/runtime/bridge-control.ts b/src/runtime/bridge-control.ts
+new file mode 100644
+index 0000000..4ae2083
+--- /dev/null
++++ b/src/runtime/bridge-control.ts
+@@ -0,0 +1,91 @@
++import { BRIDGE_CONTROL_BASE_URL, BRIDGE_CONTROL_TOKEN } from "../config";
++
++const BRIDGE_CACHE_TTL_MS = 5_000;
++
++type TimedCache<T> = {
++  value: T;
++  expiresAt: number;
++};
++
++export interface BridgeAdapterStatus {
++  configured: boolean;
++  baseUrl?: string;
++  tokenConfigured: boolean;
++}
++
++export interface BridgeFetchEnvelope<T> {
++  status: BridgeAdapterStatus;
++  data?: T;
++  error?: string;
++  fetchedAt: string;
++}
++
++const cache = new Map<string, TimedCache<unknown>>();
++const inflight = new Map<string, Promise<unknown>>();
++
++export function bridgeAdapterStatus(): BridgeAdapterStatus {
++  return {
++    configured: BRIDGE_CONTROL_BASE_URL !== "",
++    baseUrl: BRIDGE_CONTROL_BASE_URL || undefined,
++    tokenConfigured: BRIDGE_CONTROL_TOKEN !== "",
++  };
++}
++
++export async function fetchBridgeEndpoint<T>(path: string): Promise<BridgeFetchEnvelope<T>> {
++  const status = bridgeAdapterStatus();
++  const fetchedAt = new Date().toISOString();
++  if (!status.configured || !status.baseUrl) {
++    return {
++      status,
++      error: "Bridge control base URL is not configured.",
++      fetchedAt,
++    };
++  }
++
++  const key = path;
++  const now = Date.now();
++  const cached = cache.get(key);
++  if (cached && cached.expiresAt > now) {
++    return {
++      status,
++      data: cached.value as T,
++      fetchedAt,
++    };
++  }
++
++  const running = inflight.get(key);
++  if (running) {
++    try {
++      const value = (await running) as T;
++      return { status, data: value, fetchedAt };
++    } catch (error) {
++      return { status, error: error instanceof Error ? error.message : String(error), fetchedAt };
++    }
++  }
++
++  const requestPromise = (async () => {
++    const baseUrl = status.baseUrl ?? "";
++    const url = new URL(path, baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`);
++    const headers: Record<string, string> = {};
++    if (BRIDGE_CONTROL_TOKEN !== "") {
++      headers.Authorization = `Bearer ${BRIDGE_CONTROL_TOKEN}`;
++    }
++    const res = await fetch(url, { headers });
++    const text = await res.text();
++    if (!res.ok) {
++      throw new Error(`Bridge ${res.status}: ${text}`);
++    }
++    return text ? (JSON.parse(text) as T) : ({} as T);
++  })();
++
++  inflight.set(key, requestPromise);
++  try {
++    const value = await requestPromise;
++    cache.set(key, { value, expiresAt: now + BRIDGE_CACHE_TTL_MS });
++    return { status, data: value, fetchedAt };
++  } catch (error) {
++    return { status, error: error instanceof Error ? error.message : String(error), fetchedAt };
++  } finally {
++    inflight.delete(key);
++  }
++}
+diff --git a/src/ui/server.ts b/src/ui/server.ts
+index 8cb6653..77d53a5 100644
+--- a/src/ui/server.ts
++++ b/src/ui/server.ts
+@@ -64,6 +64,7 @@ import {
+ } from "../runtime/notification-center";
+ import { buildPixelState } from "../runtime/pixel-state";
+ import { buildUsageCostSnapshot, type UsageCostMode, type UsageCostSnapshot } from "../runtime/usage-cost";
++import { fetchBridgeEndpoint } from "../runtime/bridge-control";
+ import { type StructuredChatDocEntry } from "../runtime/doc-hub";
+ import {
+   PROJECT_STATES,
+@@ -840,6 +841,65 @@ export function startUiServer(port: number, toolClient: ToolClient): Server {
+         return writeText(res, 200, body, "application/json; charset=utf-8");
+       }
+ 
++      if (method === "GET" && path === "/api/bridge/overview") {
++        assertAllowedQueryParams(url.searchParams, [], true);
++        const payload = await fetchBridgeEndpoint("/control/overview");
++        return writeJson(res, payload.data ? 200 : 502, payload);
++      }
++
++      if (method === "GET" && path === "/api/bridge/staff") {
++        assertAllowedQueryParams(url.searchParams, [], true);
++        const payload = await fetchBridgeEndpoint("/control/staff");
++        return writeJson(res, payload.data ? 200 : 502, payload);
++      }
++
++      if (method === "GET" && path === "/api/bridge/tasks/board") {
++        assertAllowedQueryParams(url.searchParams, ["limit"], true);
++        const query = url.searchParams.toString();
++        const payload = await fetchBridgeEndpoint(`/control/tasks/board${query ? `?${query}` : ""}`);
++        return writeJson(res, payload.data ? 200 : 502, payload);
++      }
++
++      if (method === "GET" && path === "/api/bridge/tasks/recent") {
++        assertAllowedQueryParams(url.searchParams, ["limit"], true);
++        const query = url.searchParams.toString();
++        const payload = await fetchBridgeEndpoint(`/control/tasks/recent${query ? `?${query}` : ""}`);
++        return writeJson(res, payload.data ? 200 : 502, payload);
++      }
++
++      if (method === "GET" && path === "/api/bridge/errors/recent") {
++        assertAllowedQueryParams(url.searchParams, ["limit"], true);
++        const query = url.searchParams.toString();
++        const payload = await fetchBridgeEndpoint(`/control/errors/recent${query ? `?${query}` : ""}`);
++        return writeJson(res, payload.data ? 200 : 502, payload);
++      }
++
++      if (method === "GET" && path === "/api/bridge/settings/wiring") {
++        assertAllowedQueryParams(url.searchParams, [], true);
++        const payload = await fetchBridgeEndpoint("/control/settings/wiring");
++        return writeJson(res, payload.data ? 200 : 502, payload);
++      }
++
++      if (method === "GET" && path === "/api/bridge/settings/risk-summary") {
++        assertAllowedQueryParams(url.searchParams, [], true);
++        const payload = await fetchBridgeEndpoint("/control/settings/risk-summary");
++        return writeJson(res, payload.data ? 200 : 502, payload);
++      }
++
++      if (method === "GET" && path === "/api/bridge/nodes") {
++        assertAllowedQueryParams(url.searchParams, [], true);
++        const payload = await fetchBridgeEndpoint("/control/nodes");
++        return writeJson(res, payload.data ? 200 : 502, payload);
++      }
++
++      if (method === "GET" && path.startsWith("/api/bridge/nodes/")) {
++        assertAllowedQueryParams(url.searchParams, [], true);
++        const encodedNodeId = path.slice("/api/bridge/nodes/".length);
++        const nodeId = decodeURIComponent(encodedNodeId);
++        const payload = await fetchBridgeEndpoint(`/control/nodes/${encodeURIComponent(nodeId)}`);
++        return writeJson(res, payload.data ? 200 : 502, payload);
++      }
++
+       if (method === "GET" && (path === "/graph" || path === "/api/graph")) {
+         assertAllowedQueryParams(url.searchParams, [], true);
+         const snapshot = await readReadModelSnapshot();
+-- 
+2.43.7
+

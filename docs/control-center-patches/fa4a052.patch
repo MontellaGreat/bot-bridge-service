@@ -1,0 +1,76 @@
+From fa4a052b48c90c153ba2b7483d0335e0d3b51658 Mon Sep 17 00:00:00 2001
+From: Moying <moying@local.invalid>
+Date: Sat, 14 Mar 2026 17:59:06 +0800
+Subject: [PATCH] feat: render remote staff with overview cards
+
+---
+ src/ui/server.ts | 46 +++++++++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 43 insertions(+), 3 deletions(-)
+
+diff --git a/src/ui/server.ts b/src/ui/server.ts
+index b31fc6f..cd0ad9d 100644
+--- a/src/ui/server.ts
++++ b/src/ui/server.ts
+@@ -1735,8 +1735,8 @@ export function startUiServer(port: number, toolClient: ToolClient): Server {
+     }
+   });
+ 
+-  server.listen(port, "127.0.0.1", () => {
+-    console.log(`[mission-control] ui listening at http://127.0.0.1:${port}`);
++  server.listen(port, "0.0.0.0", () => {
++    console.log(`[mission-control] ui listening at http://0.0.0.0:${port}`);
+     void Promise.resolve().then(() => primeOpenClawCliInsights());
+     void primeUiRenderCaches(toolClient);
+   });
+@@ -4373,7 +4373,47 @@ async function renderHtml(
+   const bridgeStaffSection = bridgeStaffData
+     ? (() => {
+         const staff = Array.isArray(bridgeStaffData.staff) ? bridgeStaffData.staff as Array<Record<string, unknown>> : [];
+-        return `<section class="card" id="bridge-staff-card"><div class="overview-command-head"><div><h2>${escapeHtml(t('Remote staff signals', '远端员工信号'))}</h2><div class="meta">${escapeHtml(t('Observed worker state from remote bridge.', '来自远端 bridge 的 worker 观测状态。'))}</div></div><div>${badge('ok', String(staff.length))}</div></div>${staff.length === 0 ? `<div class="empty-state">${escapeHtml(t('No remote staff rows yet.', '暂无远端员工条目。'))}</div>` : `<ul class="story-list">${staff.slice(0,12).map((item) => `<li><strong>${escapeHtml(String(item.displayName ?? item.workerId ?? '-'))}</strong><div class="meta">${escapeHtml(String(item.nextStateHint ?? item.status ?? '-'))} · ${escapeHtml(String(item.mode ?? '-'))} · ${escapeHtml(String(item.lastTaskStatus ?? '-'))}</div><div class="meta">${escapeHtml(String(item.lastResultSummary ?? item.lastError ?? t('No recent output yet.', '最近暂无产出。')))}</div></li>`).join('')}</ul>`}</section>`;
++        const bridgeStaffCards: StaffOverviewCard[] = staff.map((item) => {
++          const agentId = String(item.targetAgent ?? item.workerId ?? 'remote-agent');
++          const displayName = String(item.displayName ?? item.workerId ?? '-');
++          const nextState = String(item.nextStateHint ?? item.status ?? 'waiting');
++          const currentWorkLabel = nextState === 'working'
++            ? t('Working on', '正在处理什么')
++            : t('Next up', '下一项');
++          const currentWork = String(
++            item.currentTaskId ?? item.lastTaskId ?? (
++              nextState === 'offline'
++                ? t('Worker offline', '远端员工离线')
++                : nextState === 'waiting'
++                  ? t('No live work right now', '当前无实时任务')
++                  : nextState === 'next-up'
++                    ? t('Waiting for the next remote task', '等待下一项远端任务')
++                    : t('Handling remote work', '正在处理远端工作')
++            )
++          );
++          return {
++            agentId,
++            displayName,
++            identity: deriveAgentAnimalIdentity(agentId),
++            roleLabel: String(item.nodeId ?? t('Remote node', '远端节点')),
++            statusLabel:
++              nextState === 'working'
++                ? t('Working', '工作中')
++                : nextState === 'offline'
++                  ? t('Offline', '离线')
++                  : nextState === 'stale'
++                    ? t('Needs attention', '需要关注')
++                    : nextState === 'next-up'
++                      ? t('Next up', '下一项待接')
++                      : t('Standing by', '待命'),
++            currentWorkLabel,
++            currentWork,
++            recentOutput: String(item.lastResultSummary ?? item.lastError ?? t('No recent output yet.', '最近暂无产出。')),
++            scheduledLabel: String(item.mode ?? '-'),
++          } satisfies StaffOverviewCard;
++        });
++        const cardsHtml = renderStaffOverviewCards(bridgeStaffCards, options.language);
++        return `<section class="card" id="bridge-staff-card"><div class="overview-command-head"><div><h2>${escapeHtml(t('Remote staff signals', '远端员工信号'))}</h2><div class="meta">${escapeHtml(t('Observed worker state from remote bridge.', '来自远端 bridge 的 worker 观测状态。'))}</div></div><div>${badge('ok', String(staff.length))}</div></div>${staff.length === 0 ? `<div class="empty-state">${escapeHtml(t('No remote staff rows yet.', '暂无远端员工条目。'))}</div>` : cardsHtml}</section>`;
+       })()
+     : renderBridgeErrorNotice(t('Remote staff signals', '远端员工信号'), bridgeStaffEnvelope);
+ 
+-- 
+2.43.7
+

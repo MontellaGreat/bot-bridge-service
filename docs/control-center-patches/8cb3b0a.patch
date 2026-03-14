@@ -1,0 +1,162 @@
+From 8cb3b0afc7ede7c8c535c612d64ed6f7312527be Mon Sep 17 00:00:00 2001
+From: Moying <moying@local.invalid>
+Date: Sat, 14 Mar 2026 14:08:29 +0800
+Subject: [PATCH] feat: wire bridge observability into control center ui
+
+---
+ src/ui/server.ts | 95 +++++++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 93 insertions(+), 2 deletions(-)
+
+diff --git a/src/ui/server.ts b/src/ui/server.ts
+index 77d53a5..b31fc6f 100644
+--- a/src/ui/server.ts
++++ b/src/ui/server.ts
+@@ -4252,6 +4252,10 @@ async function renderHtml(
+   const needsSecuritySummary = activeSection === "settings";
+   const needsUpdateSummary = activeSection === "settings";
+   const needsMemoryState = activeSection === "memory";
++  const needsBridgeOverview = activeSection === "overview";
++  const needsBridgeStaff = activeSection === "team";
++  const needsBridgeTasks = activeSection === "projects-tasks";
++  const needsBridgeSettings = activeSection === "settings";
+   markRenderPhase("snapshot");
+   const exceptions = commanderExceptions(snapshot);
+   const exceptionsFeed = commanderExceptionsFeed(snapshot);
+@@ -4289,7 +4293,7 @@ async function renderHtml(
+     loadCachedOfficeSessionPresence(),
+   ]);
+   markRenderPhase("shared-data");
+-  const [teamSnapshot, memoryFiles, memoryFacetOptions, workspaceFiles, workspaceFacetOptions, taskEvidenceItems, connectionHealthSummary, securitySummary, updateSummary, memoryStateSummary] = await Promise.all([
++  const [teamSnapshot, memoryFiles, memoryFacetOptions, workspaceFiles, workspaceFacetOptions, taskEvidenceItems, connectionHealthSummary, securitySummary, updateSummary, memoryStateSummary, bridgeOverviewEnvelope, bridgeStaffEnvelope, bridgeTasksBoardEnvelope, bridgeWiringEnvelope, bridgeRiskEnvelope] = await Promise.all([
+     needsTeamSnapshot
+       ? loadTeamSnapshot(officeRoster)
+       : Promise.resolve<TeamSnapshot>({
+@@ -4314,8 +4318,91 @@ async function renderHtml(
+     needsSecuritySummary ? loadCachedOpenClawSecuritySummary() : Promise.resolve<OpenClawSecuritySummary | undefined>(undefined),
+     needsUpdateSummary ? loadCachedOpenClawUpdateSummary() : Promise.resolve<OpenClawUpdateSummary | undefined>(undefined),
+     needsMemoryState ? loadCachedOpenClawMemorySummary() : Promise.resolve<OpenClawMemorySummary | undefined>(undefined),
++    needsBridgeOverview ? fetchBridgeEndpoint<Record<string, unknown>>("/control/overview") : Promise.resolve(undefined),
++    needsBridgeStaff ? fetchBridgeEndpoint<Record<string, unknown>>("/control/staff") : Promise.resolve(undefined),
++    needsBridgeTasks ? fetchBridgeEndpoint<Record<string, unknown>>("/control/tasks/board") : Promise.resolve(undefined),
++    needsBridgeSettings ? fetchBridgeEndpoint<Record<string, unknown>>("/control/settings/wiring") : Promise.resolve(undefined),
++    needsBridgeSettings ? fetchBridgeEndpoint<Record<string, unknown>>("/control/settings/risk-summary") : Promise.resolve(undefined),
+   ]);
+   markRenderPhase("section-assets");
++
++  const bridgeEnvelopeError = (envelope: unknown): string | null => {
++    const root = (envelope && typeof envelope === "object") ? envelope as Record<string, unknown> : null;
++    const error = typeof root?.error === "string" ? root.error : null;
++    return error;
++  };
++
++  const bridgeEnvelopeData = (envelope: unknown): Record<string, unknown> | null => {
++    const root = (envelope && typeof envelope === "object") ? envelope as Record<string, unknown> : null;
++    const data = root?.data;
++    return data && typeof data === "object" ? data as Record<string, unknown> : null;
++  };
++
++  const renderBridgeErrorNotice = (title: string, envelope: unknown): string => {
++    const error = bridgeEnvelopeError(envelope);
++    if (!error) return "";
++    return `<section class="card"><h2>${escapeHtml(title)}</h2><div class="meta">${escapeHtml(t("Bridge data could not be loaded.", "Bridge 数据暂未接通。"))}</div><div class="callout danger" style="margin-top:12px;">${escapeHtml(error)}</div></section>`;
++  };
++
++  const bridgeOverviewData = bridgeEnvelopeData(bridgeOverviewEnvelope);
++  const bridgeStaffData = bridgeEnvelopeData(bridgeStaffEnvelope);
++  const bridgeTasksData = bridgeEnvelopeData(bridgeTasksBoardEnvelope);
++  const bridgeWiringData = bridgeEnvelopeData(bridgeWiringEnvelope);
++  const bridgeRiskData = bridgeEnvelopeData(bridgeRiskEnvelope);
++
++  const bridgeOverviewSection = bridgeOverviewData
++    ? (() => {
++        const summary = (bridgeOverviewData.summary && typeof bridgeOverviewData.summary === 'object') ? bridgeOverviewData.summary as Record<string, unknown> : {};
++        const staff = Array.isArray(bridgeOverviewData.staff) ? bridgeOverviewData.staff as Array<Record<string, unknown>> : [];
++        const attention = Array.isArray(bridgeOverviewData.attention) ? bridgeOverviewData.attention as Array<Record<string, unknown>> : [];
++        const riskCount = Array.isArray(bridgeOverviewData.risks) ? bridgeOverviewData.risks.length : 0;
++        const chips = [
++          { label: t('Online workers', '在线员工'), value: String(summary.onlineWorkers ?? '-') },
++          { label: t('Busy workers', '忙碌员工'), value: String(summary.busyWorkers ?? '-') },
++          { label: t('Queued tasks', '排队任务'), value: String(summary.queuedTasks ?? '-') },
++          { label: t('Running tasks', '运行任务'), value: String(summary.runningTasks ?? '-') },
++          { label: t('Dead-letter tasks', '死信任务'), value: String(summary.deadLetterTasks ?? '-') },
++          { label: t('Recent failures', '近期异常'), value: String(summary.recentFailures ?? '-') },
++        ].map((item) => `<div class="status-chip"><span>${escapeHtml(item.label)}</span><strong>${escapeHtml(item.value)}</strong></div>`).join('');
++        const staffRows = staff.length === 0 ? `<div class="empty-state">${escapeHtml(t('No remote staff signal yet.', '暂无远端员工信号。'))}</div>` : `<ul class="story-list">${staff.slice(0,6).map((item) => `<li><strong>${escapeHtml(String(item.workerId ?? '-'))}</strong><div class="meta">${escapeHtml(String(item.nodeId ?? '-'))} / ${escapeHtml(String(item.targetAgent ?? '-'))} · ${escapeHtml(String(item.nextStateHint ?? item.status ?? '-'))}</div></li>`).join('')}</ul>`;
++        const attentionRows = attention.length === 0 ? `<div class="empty-state">${escapeHtml(t('No bridge attention item right now.', '当前没有 bridge 待关注项。'))}</div>` : `<ul class="story-list">${attention.map((item) => `<li>${escapeHtml(String(item.message ?? '-'))}</li>`).join('')}</ul>`;
++        return `<section class="card" id="bridge-overview-card"><div class="overview-command-head"><div><h2>${escapeHtml(t('Remote bridge overview', '远端 Bridge 总览'))}</h2><div class="meta">${escapeHtml(t('Cross-server execution summary from bot-bridge-service.', '来自 bot-bridge-service 的跨服务器执行摘要。'))}</div></div><div>${badge(riskCount > 0 ? 'warn' : 'ok', escapeHtml(String(bridgeOverviewData.status ?? 'unknown')))}</div></div><div class="status-strip">${chips}</div><div class="grid-2" style="margin-top:12px;"><div><h3 style="margin-bottom:8px;">${escapeHtml(t('Who is busy', '谁在忙'))}</h3>${staffRows}</div><div><h3 style="margin-bottom:8px;">${escapeHtml(t('Need attention', '待关注'))}</h3>${attentionRows}</div></div></section>`;
++      })()
++    : renderBridgeErrorNotice(t('Remote bridge overview', '远端 Bridge 总览'), bridgeOverviewEnvelope);
++
++  const bridgeStaffSection = bridgeStaffData
++    ? (() => {
++        const staff = Array.isArray(bridgeStaffData.staff) ? bridgeStaffData.staff as Array<Record<string, unknown>> : [];
++        return `<section class="card" id="bridge-staff-card"><div class="overview-command-head"><div><h2>${escapeHtml(t('Remote staff signals', '远端员工信号'))}</h2><div class="meta">${escapeHtml(t('Observed worker state from remote bridge.', '来自远端 bridge 的 worker 观测状态。'))}</div></div><div>${badge('ok', String(staff.length))}</div></div>${staff.length === 0 ? `<div class="empty-state">${escapeHtml(t('No remote staff rows yet.', '暂无远端员工条目。'))}</div>` : `<ul class="story-list">${staff.slice(0,12).map((item) => `<li><strong>${escapeHtml(String(item.displayName ?? item.workerId ?? '-'))}</strong><div class="meta">${escapeHtml(String(item.nextStateHint ?? item.status ?? '-'))} · ${escapeHtml(String(item.mode ?? '-'))} · ${escapeHtml(String(item.lastTaskStatus ?? '-'))}</div><div class="meta">${escapeHtml(String(item.lastResultSummary ?? item.lastError ?? t('No recent output yet.', '最近暂无产出。')))}</div></li>`).join('')}</ul>`}</section>`;
++      })()
++    : renderBridgeErrorNotice(t('Remote staff signals', '远端员工信号'), bridgeStaffEnvelope);
++
++  const bridgeTasksSection = bridgeTasksData
++    ? (() => {
++        const active = Array.isArray(bridgeTasksData.active) ? bridgeTasksData.active as Array<Record<string, unknown>> : [];
++        const recent = Array.isArray(bridgeTasksData.recent) ? bridgeTasksData.recent as Array<Record<string, unknown>> : [];
++        const deadLetters = Array.isArray(bridgeTasksData.deadLetters) ? bridgeTasksData.deadLetters as Array<Record<string, unknown>> : [];
++        const renderRows = (items: Array<Record<string, unknown>>, empty: string) => items.length === 0 ? `<div class="empty-state">${escapeHtml(empty)}</div>` : `<ul class="story-list">${items.slice(0,8).map((item) => `<li><strong>${escapeHtml(String(item.title ?? item.id ?? '-'))}</strong>${badge(String(item.status ?? 'unknown'), String(item.status ?? 'unknown'))}<div class="meta">${escapeHtml(String(item.resultSummary ?? item.error ?? t('No summary yet.', '暂无摘要。')))}</div></li>`).join('')}</ul>`;
++        return `<section class="card" id="bridge-task-card"><div class="overview-command-head"><div><h2>${escapeHtml(t('Remote task evidence', '远端任务证据'))}</h2><div class="meta">${escapeHtml(t('Board-level execution evidence from bridge.', '来自 bridge 的任务级执行证据。'))}</div></div><div>${badge(deadLetters.length > 0 ? 'warn' : 'ok', `${active.length}/${recent.length}`)}</div></div><div class="grid-3"><div><h3 style="margin-bottom:8px;">${escapeHtml(t('Active', '活跃'))}</h3>${renderRows(active, t('No active bridge task.', '暂无活跃 bridge 任务。'))}</div><div><h3 style="margin-bottom:8px;">${escapeHtml(t('Recent', '最近'))}</h3>${renderRows(recent, t('No recent bridge task.', '暂无最近 bridge 任务。'))}</div><div><h3 style="margin-bottom:8px;">${escapeHtml(t('Dead letters', '死信'))}</h3>${renderRows(deadLetters, t('No dead-letter task.', '暂无死信任务。'))}</div></div></section>`;
++      })()
++    : renderBridgeErrorNotice(t('Remote task evidence', '远端任务证据'), bridgeTasksBoardEnvelope);
++
++  const bridgeSettingsSection = bridgeWiringData
++    ? (() => {
++        const wiring = (bridgeWiringData.wiring && typeof bridgeWiringData.wiring === 'object') ? bridgeWiringData.wiring as Record<string, unknown> : {};
++        const notes = Array.isArray(bridgeWiringData.notes) ? bridgeWiringData.notes as string[] : [];
++        const rows = Object.entries(wiring).map(([key, value]) => `<tr><td>${escapeHtml(key)}</td><td>${escapeHtml(String(value))}</td></tr>`).join('');
++        return `<section class="card" id="bridge-wiring-card"><h2>${escapeHtml(t('Remote bridge wiring', '远端 Bridge 接线状态'))}</h2><table><thead><tr><th>${escapeHtml(t('Signal', '信号'))}</th><th>${escapeHtml(t('State', '状态'))}</th></tr></thead><tbody>${rows}</tbody></table>${notes.length === 0 ? '' : `<ul class="story-list" style="margin-top:12px;">${notes.map((item) => `<li>${escapeHtml(item)}</li>`).join('')}</ul>`}</section>`;
++      })()
++    : renderBridgeErrorNotice(t('Remote bridge wiring', '远端 Bridge 接线状态'), bridgeWiringEnvelope);
++
++  const bridgeRiskSection = bridgeRiskData
++    ? (() => {
++        const risks = Array.isArray(bridgeRiskData.risks) ? bridgeRiskData.risks as Array<Record<string, unknown>> : [];
++        return `<section class="card" id="bridge-risk-card"><h2>${escapeHtml(t('Remote bridge risk summary', '远端 Bridge 风险摘要'))}</h2>${risks.length === 0 ? `<div class="empty-state">${escapeHtml(t('No bridge risk is visible right now.', '当前没有 bridge 风险。'))}</div>` : `<ul class="story-list">${risks.map((item) => `<li><strong>${escapeHtml(String(item.title ?? item.code ?? '-'))}</strong><div class="meta">${escapeHtml(String(item.message ?? '-'))}</div><div class="meta">${escapeHtml(String(item.suggestion ?? '-'))}</div></li>`).join('')}</ul>`}</section>`;
++      })()
++    : renderBridgeErrorNotice(t('Remote bridge risk summary', '远端 Bridge 风险摘要'), bridgeRiskEnvelope);
++
+   const usageToday = usageCost.periods.find((item) => item.key === "today");
+   const usage7d = usageCost.periods.find((item) => item.key === "7d");
+   const usage30d = usageCost.periods.find((item) => item.key === "30d");
+@@ -5285,6 +5372,7 @@ async function renderHtml(
+     </article>
+   </div>`;
+   const overviewSection = `
++    ${bridgeOverviewSection}
+     <section class="overview-v3-shell" id="overview-decision-home">
+       <article class="card overview-primary-card" id="overview-primary-card">
+         <div class="overview-primary-head">
+@@ -5708,7 +5796,7 @@ async function renderHtml(
+       </div>
+     </details>
+   `;
+-  const teamUnifiedSection = teamSection;
++  const teamUnifiedSection = `${bridgeStaffSection}${teamSection}`;
+   const hasTrackedTaskPanels = tasks.length > 0 || pendingDecisionCount > 0 || taskCertaintyCards.length > 0;
+   const trackedTaskDetailsOpen = pendingDecisionCount > 0 || taskCertaintyCards.length > 0;
+   const trackedTaskSummaryText = hasTrackedTaskPanels
+@@ -5855,6 +5943,7 @@ async function renderHtml(
+     `
+     : `<div class="meta">${escapeHtml(trackedTaskExplanation)}</div>`;
+   const projectsSection = `
++    ${bridgeTasksSection}
+     <section class="task-hub-grid">
+       ${calendarSection}
+       ${cronExecutionSection}
+@@ -5927,6 +6016,8 @@ async function renderHtml(
+     ${connectionHealthCard}
+     ${securityRiskSection}
+     ${updateStatusSection}
++    ${bridgeSettingsSection}
++    ${bridgeRiskSection}
+     <section class="card">
+       <h2>安全开关</h2>
+       <table>
+-- 
+2.43.7
+
