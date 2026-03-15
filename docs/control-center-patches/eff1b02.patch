@@ -1,0 +1,154 @@
+From eff1b0262c0cfec151f965db669a4d4984ea5fb9 Mon Sep 17 00:00:00 2001
+From: Moying <moying@local.invalid>
+Date: Sun, 15 Mar 2026 10:41:00 +0800
+Subject: [PATCH] fix(ui): merge remote agent activity into overview
+
+---
+ src/ui/server.ts | 58 +++++++++++++++++++++++++++++++++++++++++-------
+ 1 file changed, 50 insertions(+), 8 deletions(-)
+
+diff --git a/src/ui/server.ts b/src/ui/server.ts
+index 0c0b801..c25a6a7 100644
+--- a/src/ui/server.ts
++++ b/src/ui/server.ts
+@@ -611,6 +611,8 @@ interface ExecutionAgentSummary {
+   enabledCronJobs: number;
+   cronJobNames: string[];
+   recentTokens30d: number;
++  leadAssignment?: string;
++  workloadLabel?: string;
+ }
+ 
+ interface StaffOverviewCard {
+@@ -4367,7 +4369,12 @@ async function renderHtml(
+           { label: t('Dead-letter tasks', '死信任务'), value: String(summary.deadLetterTasks ?? '-') },
+           { label: t('Recent failures', '近期异常'), value: String(summary.recentFailures ?? '-') },
+         ].map((item) => `<div class="status-chip"><span>${escapeHtml(item.label)}</span><strong>${escapeHtml(item.value)}</strong></div>`).join('');
+-        const staffRows = staff.length === 0 ? `<div class="empty-state">${escapeHtml(t('No remote staff signal yet.', '暂无远端员工信号。'))}</div>` : `<ul class="story-list">${staff.slice(0,6).map((item) => `<li><strong>${escapeHtml(String(item.workerId ?? '-'))}</strong><div class="meta">${escapeHtml(String(item.nodeId ?? '-'))} / ${escapeHtml(String(item.targetAgent ?? '-'))} · ${escapeHtml(String(item.nextStateHint ?? item.status ?? '-'))}</div></li>`).join('')}</ul>`;
++        const staffRows = staff.length === 0 ? `<div class="empty-state">${escapeHtml(t('No remote staff signal yet.', '暂无远端员工信号。'))}</div>` : `<ul class="story-list">${staff.slice(0,6).map((item) => {
++          const agentLabel = String(item.targetAgent ?? item.displayName ?? item.workerId ?? '-');
++          const nodeLabel = String(item.nodeId ?? '-');
++          const stateLabel = String(item.nextStateHint ?? item.status ?? '-');
++          return `<li><strong>${escapeHtml(agentLabel)}</strong><div class="meta">${escapeHtml(nodeLabel)} · ${escapeHtml(stateLabel)}</div></li>`;
++        }).join('')}</ul>`;
+         const attentionRows = attention.length === 0 ? `<div class="empty-state">${escapeHtml(t('No bridge attention item right now.', '当前没有 bridge 待关注项。'))}</div>` : `<ul class="story-list">${attention.map((item) => `<li>${escapeHtml(String(item.message ?? '-'))}</li>`).join('')}</ul>`;
+         return `<section class="card" id="bridge-overview-card"><div class="overview-command-head"><div><h2>${escapeHtml(t('Remote bridge overview', '远端 Bridge 总览'))}</h2><div class="meta">${escapeHtml(t('Cross-server execution summary from bot-bridge-service.', '来自 bot-bridge-service 的跨服务器执行摘要。'))}</div></div><div>${badge(riskCount > 0 ? 'warn' : 'ok', escapeHtml(String(bridgeOverviewData.status ?? 'unknown')))}</div></div><div class="status-strip">${chips}</div><div class="grid-2" style="margin-top:12px;"><div><h3 style="margin-bottom:8px;">${escapeHtml(t('Who is busy', '谁在忙'))}</h3>${staffRows}</div><div><h3 style="margin-bottom:8px;">${escapeHtml(t('Need attention', '待关注'))}</h3>${attentionRows}</div></div></section>`;
+       })()
+@@ -4378,7 +4385,7 @@ async function renderHtml(
+         const staff = Array.isArray(bridgeStaffData.staff) ? bridgeStaffData.staff as Array<Record<string, unknown>> : [];
+         const bridgeStaffCards: StaffOverviewCard[] = staff.map((item) => {
+           const agentId = String(item.targetAgent ?? item.workerId ?? 'remote-agent');
+-          const displayName = String(item.displayName ?? item.workerId ?? '-');
++          const displayName = String(item.displayName ?? item.targetAgent ?? item.workerId ?? '-');
+           const nextState = String(item.nextStateHint ?? item.status ?? 'waiting');
+           const currentWorkLabel = nextState === 'working'
+             ? t('Working on', '正在处理什么')
+@@ -4476,6 +4483,7 @@ async function renderHtml(
+     openclawCronJobs,
+     officeRoster.entries,
+     usageAgentTokensByKey,
++    Array.isArray(bridgeStaffData?.staff) ? (bridgeStaffData?.staff as Array<Record<string, unknown>>) : [],
+   );
+   const taskSignalItems = mergeSessionConversationItems(taskEvidenceItems, sessionPreview.items);
+   const taskExecutionChainCards = buildTaskExecutionChainCards({
+@@ -5312,17 +5320,23 @@ async function renderHtml(
+   const overviewBusyAgents = executionAgentSummaries
+     .filter((item) => item.activeSessions > 0 || item.activeTasks > 0 || item.enabledCronJobs > 0)
+     .sort((a, b) => b.activeTasks - a.activeTasks || b.activeSessions - a.activeSessions || b.enabledCronJobs - a.enabledCronJobs)
+-    .slice(0, 3);
++    .slice(0, 6);
+   const overviewBusyCardsHtml =
+     overviewBusyAgents.length === 0
+       ? `<div class="empty-state">${escapeHtml(t("No staff are carrying live work right now.", "当前没有员工在承担实时工作。"))}</div>`
+       : `<div class="overview-busy-grid">${overviewBusyAgents
+           .map((item) => {
+-            const leadAssignment = item.cronJobNames[0] ?? t("No live assignment", "暂无实时分派");
++            const leadAssignment = item.leadAssignment ?? item.cronJobNames[0] ?? t("No live assignment", "暂无实时分派");
++            const liveLabel =
++              item.workloadLabel === "remote-offline"
++                ? t("Remote offline", "远端离线")
++                : item.workloadLabel === "remote"
++                  ? t("Remote", "远端")
++                  : item.workloadLabel ?? t("Live", "实时");
+             return `<article class="overview-busy-card">
+               <div class="overview-busy-head">
+                 <strong>${escapeHtml(item.displayName)}</strong>
+-                <span>${escapeHtml(t("Live", "实时"))}</span>
++                <span>${escapeHtml(liveLabel)}</span>
+               </div>
+               <div class="overview-busy-copy">${escapeHtml(leadAssignment)}</div>
+               <div class="meta">${escapeHtml(t("Tasks", "任务"))} ${item.activeTasks} · ${escapeHtml(t("Sessions", "会话"))} ${item.activeSessions} · Cron ${item.enabledCronJobs}</div>
+@@ -5426,7 +5440,6 @@ async function renderHtml(
+     </article>
+   </div>`;
+   const overviewSection = `
+-    ${bridgeOverviewSection}
+     ${bridgeNodesSection}
+     <section class="overview-v3-shell" id="overview-decision-home">
+       <article class="card overview-primary-card" id="overview-primary-card">
+@@ -10058,6 +10071,7 @@ export function buildExecutionAgentSummaries(
+   cronJobs: OpenclawCronJobSummary[],
+   rosterEntries: AgentRosterEntry[],
+   usageAgentTokensByKey: Map<string, number>,
++  remoteStaff: Array<Record<string, unknown>> = [],
+ ): ExecutionAgentSummary[] {
+   const configuredRosterKeys = new Set(
+     rosterEntries.map((entry) => normalizeLookupKey(entry.agentId)).filter((key) => key.length > 0),
+@@ -10091,6 +10105,11 @@ export function buildExecutionAgentSummaries(
+   for (const key of usageAgentTokensByKey.keys()) {
+     registerAgent(key);
+   }
++  for (const item of remoteStaff) {
++    const remoteAgentId = String(item.targetAgent ?? item.displayName ?? item.workerId ?? "").trim();
++    if (!remoteAgentId) continue;
++    registerAgent(remoteAgentId, String(item.targetAgent ?? item.displayName ?? remoteAgentId));
++  }
+ 
+   const activeSessionCountByKey = new Map<string, number>();
+   for (const session of snapshot.sessions) {
+@@ -10122,17 +10141,40 @@ export function buildExecutionAgentSummaries(
+     enabledCronNamesByKey.set(key, bucket);
+   }
+ 
++  const remoteSummaryByKey = new Map<string, { leadAssignment?: string; workloadLabel?: string; activeTasks: number; activeSessions: number }>();
++  for (const item of remoteStaff) {
++    const remoteAgentId = String(item.targetAgent ?? item.displayName ?? item.workerId ?? "").trim();
++    if (!remoteAgentId) continue;
++    const key = normalizeLookupKey(remoteAgentId);
++    if (!allowUnknownAgents && !configuredRosterKeys.has(key)) continue;
++    const currentTask = String(item.currentTaskId ?? item.lastTaskId ?? item.lastResultSummary ?? item.lastError ?? "").trim();
++    const nextState = String(item.nextStateHint ?? item.status ?? "waiting").trim();
++    const existing = remoteSummaryByKey.get(key) ?? { activeTasks: 0, activeSessions: 0 };
++    if (!existing.leadAssignment && currentTask) existing.leadAssignment = currentTask;
++    if (!existing.workloadLabel) {
++      existing.workloadLabel = nextState === "offline" ? "remote-offline" : "remote";
++    }
++    if (nextState === "working") {
++      existing.activeTasks += 1;
++      existing.activeSessions += 1;
++    }
++    remoteSummaryByKey.set(key, existing);
++  }
++
+   const rows: ExecutionAgentSummary[] = [];
+   for (const [key, agentId] of canonicalIdByKey.entries()) {
+     const cronNames = [...new Set((enabledCronNamesByKey.get(key) ?? []).map((item) => item.trim()).filter(Boolean))];
++    const remoteSummary = remoteSummaryByKey.get(key);
+     rows.push({
+       agentId,
+       displayName: displayNameByKey.get(key) ?? humanizeOperatorLabel(agentId),
+-      activeSessions: activeSessionCountByKey.get(key) ?? 0,
+-      activeTasks: activeTaskCountByKey.get(key) ?? 0,
++      activeSessions: (activeSessionCountByKey.get(key) ?? 0) + (remoteSummary?.activeSessions ?? 0),
++      activeTasks: (activeTaskCountByKey.get(key) ?? 0) + (remoteSummary?.activeTasks ?? 0),
+       enabledCronJobs: cronNames.length,
+       cronJobNames: cronNames,
+       recentTokens30d: usageAgentTokensByKey.get(key) ?? 0,
++      leadAssignment: remoteSummary?.leadAssignment,
++      workloadLabel: remoteSummary?.workloadLabel,
+     });
+   }
+ 
+-- 
+2.43.7
+
